@@ -27,3 +27,105 @@
     }
   }
 }
+
+
+#!/usr/bin/env bash
+#
+# Read-only discovery for the CloudWatch memory-metrics pilot.
+# Every call is describe/list/get. Nothing is created, modified or deleted.
+#
+# Usage:
+#   ./hxsa-discovery.sh
+#   PROFILE=srvchxsa REGION=us-east-1 ./hxsa-discovery.sh
+#   PROFILE=other OUT_DIR=/tmp/disc ./hxsa-discovery.sh
+
+set -uo pipefail
+
+# ---------------------------------------------------------------- config ----
+: "${PROFILE:=srvchxsa}"
+: "${REGION:=$(aws configure get region --profile "${PROFILE}" 2>/dev/null || echo us-east-1)}"
+: "${OUT_DIR:=./hxsa-discovery}"
+: "${K8S_NAMESPACE:=amazon-cloudwatch}"
+: "${METRIC_NAMESPACES:=CWAgent ContainerInsights}"
+
+AWS=(aws --profile "${PROFILE}" --region "${REGION}" --no-cli-pager)
+
+mkdir -p "${OUT_DIR}"
+OUT="${OUT_DIR}/discovery-$(date -u +%Y%m%dT%H%M%SZ).txt"
+
+# --------------------------------------------------------------- helpers ----
+section() { printf '\n\n%s\n== %s\n%s\n' "$(printf '=%.0s' {1..70})" "$1" "$(printf '=%.0s' {1..70})" >>"${OUT}"; }
+
+run() {
+  local label="$1"; shift
+  { printf '\n--- %s\n$ %s\n' "${label}" "$*"; } >>"${OUT}"
+  if ! "$@" >>"${OUT}" 2>&1; then
+    printf '[FAILED: exit %s — permission denied, not enabled, or not applicable]\n' "$?" >>"${OUT}"
+  fi
+}
+
+capture() { "$@" 2>/dev/null; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# ------------------------------------------------------------------ start ----
+{
+  echo "CloudWatch memory-metrics pilot — environment discovery"
+  echo "generated : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "profile   : ${PROFILE}"
+  echo "region    : ${REGION}"
+  echo "host      : $(hostname)"
+  echo
+  echo "All commands below are read-only (describe/list/get)."
+} >"${OUT}"
+
+# ------------------------------------------------------- 1. identity ----
+section "1. IDENTITY AND ACCOUNT"
+run "Caller identity"            "${AWS[@]}" sts get-caller-identity
+run "Account aliases"            "${AWS[@]}" iam list-account-aliases
+run "Organization (may be denied from a member account)" \
+                                 "${AWS[@]}" organizations describe-organization
+
+# ------------------------------------------------------- 2. ec2 inventory ----
+section "2. EC2 INVENTORY"
+run "All instances (summary)" \
+  "${AWS[@]}" ec2 describe-instances \
+    --query 'Reservations[].Instances[].{
+        Id:InstanceId,
+        Name:Tags[?Key==`Name`]|[0].Value,
+        State:State.Name,
+        Type:InstanceType,
+        Platform:PlatformDetails,
+        Profile:IamInstanceProfile.Arn,
+        Subnet:SubnetId,
+        Vpc:VpcId,
+        EksCluster:Tags[?Key==`eks:cluster-name`]|[0].Value,
+        NodeGroup:Tags[?Key==`eks:nodegroup-name`]|[0].Value,
+        AsgName:Tags[?Key==`aws:autoscaling:groupName`]|[0].Value
+      }' --output table
+
+run "Running instance count by type" \
+  "${AWS[@]}" ec2 describe-instances \
+    --filters Name=instance-state-name,Values=running \
+    --query 'Reservations[].Instances[].InstanceType' --output text
+
+run "All tags on running instances (spot conventions / ownership)" \
+  "${AWS[@]}" ec2 describe-instances \
+    --filters Name=instance-state-name,Values=running \
+    --query 'Reservations[].Instances[].{Id:InstanceId,Tags:Tags}' --output json
+
+run "Auto Scaling groups" \
+  "${AWS[@]}" autoscaling describe-auto-scaling-groups \
+    --query 'AutoScalingGroups[].{Name:AutoScalingGroupName,Min:MinSize,Max:MaxSize,Desired:DesiredCapacity,Instances:length(Instances)}' \
+    --output table
+
+# --------------------------------------------------------------- 3. iam ----
+section "3. IAM — INSTANCE PROFILES AND ROLES IN USE"
+
+PROFILE_ARNS=$(capture "${AWS[@]}" ec2 describe-instances \
+  --query 'Reservations[].Instances[].IamInstanceProfile.Arn' --output text | tr '\t' '\n' | sort -u | grep -v '^None$' || true)
+
+if [[ -z "${PROFILE_ARNS}" ]]; then
+  echo -e "\n[no instances have an instance profile attached]" >>"${OUT}"
+else
+  while read -r arn; do
