@@ -1,0 +1,19 @@
+P="--profile srvchxsa"
+
+# 1. What EC2 exists, and which are EKS nodes (4th column = cluster tag, None = standalone)
+aws ec2 describe-instances $P \
+  --filters Name=instance-state-name,Values=running \
+  --query 'Reservations[].Instances[].[InstanceId,Tags[?Key==`Name`]|[0].Value,InstanceType,Tags[?Key==`eks:cluster-name`]|[0].Value,IamInstanceProfile.Arn]' \
+  --output text
+
+# 2. Which of them can SSM actually reach
+aws ssm describe-instance-information $P \
+  --query 'InstanceInformationList[].[InstanceId,PingStatus,AgentVersion,PlatformName]' \
+  --output text
+
+# 3. Is anything already publishing memory to CWAgent
+aws cloudwatch list-metrics $P --namespace CWAgent --metric-name mem_used_percent \
+  --query 'Metrics[].Dimensions' --output json
+
+# 4. Compute Optimizer on or off
+aws compute-optimizer get-enrollment-status $P
