@@ -17,3 +17,10 @@ aws cloudwatch list-metrics $P --namespace CWAgent --metric-name mem_used_percen
 
 # 4. Compute Optimizer on or off
 aws compute-optimizer get-enrollment-status $P
+
+# Is memory data already flowing for the expensive 16?
+aws cloudwatch list-metrics $P --namespace ContainerInsights \
+  --query 'Metrics[?MetricName==`node_memory_utilization`].Dimensions' --output json
+
+# Is SSM Agent even installed locally, or is it an install + IAM problem?
+systemctl status amazon-ssm-agent --no-pager 2>&1 | head -5; rpm -q amazon-ssm-agent
