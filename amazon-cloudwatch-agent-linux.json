@@ -29,56 +29,6 @@
 }
 
 
-#!/usr/bin/env bash
-#
-# Read-only discovery for the CloudWatch memory-metrics pilot.
-# Every call is describe/list/get. Nothing is created, modified or deleted.
-#
-# Usage:
-#   ./hxsa-discovery.sh
-#   PROFILE=srvchxsa REGION=us-east-1 ./hxsa-discovery.sh
-#   PROFILE=other OUT_DIR=/tmp/disc ./hxsa-discovery.sh
-
-set -uo pipefail
-
-# ---------------------------------------------------------------- config ----
-: "${PROFILE:=srvchxsa}"
-: "${REGION:=$(aws configure get region --profile "${PROFILE}" 2>/dev/null || echo us-east-1)}"
-: "${OUT_DIR:=./hxsa-discovery}"
-: "${K8S_NAMESPACE:=amazon-cloudwatch}"
-: "${METRIC_NAMESPACES:=CWAgent ContainerInsights}"
-
-AWS=(aws --profile "${PROFILE}" --region "${REGION}" --no-cli-pager)
-
-mkdir -p "${OUT_DIR}"
-OUT="${OUT_DIR}/discovery-$(date -u +%Y%m%dT%H%M%SZ).txt"
-
-# --------------------------------------------------------------- helpers ----
-section() { printf '\n\n%s\n== %s\n%s\n' "$(printf '=%.0s' {1..70})" "$1" "$(printf '=%.0s' {1..70})" >>"${OUT}"; }
-
-run() {
-  local label="$1"; shift
-  { printf '\n--- %s\n$ %s\n' "${label}" "$*"; } >>"${OUT}"
-  if ! "$@" >>"${OUT}" 2>&1; then
-    printf '[FAILED: exit %s — permission denied, not enabled, or not applicable]\n' "$?" >>"${OUT}"
-  fi
-}
-
-capture() { "$@" 2>/dev/null; }
-
-have() { command -v "$1" >/dev/null 2>&1; }
-
-# ------------------------------------------------------------------ start ----
-{
-  echo "CloudWatch memory-metrics pilot — environment discovery"
-  echo "generated : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  echo "profile   : ${PROFILE}"
-  echo "region    : ${REGION}"
-  echo "host      : $(hostname)"
-  echo
-  echo "All commands below are read-only (describe/list/get)."
-} >"${OUT}"
-
 # ------------------------------------------------------- 1. identity ----
 section "1. IDENTITY AND ACCOUNT"
 run "Caller identity"            "${AWS[@]}" sts get-caller-identity
@@ -129,3 +79,146 @@ if [[ -z "${PROFILE_ARNS}" ]]; then
   echo -e "\n[no instances have an instance profile attached]" >>"${OUT}"
 else
   while read -r arn; do
+    [[ -z "${arn}" ]] && continue
+    pname="${arn##*/}"
+    run "Instance profile: ${pname}" "${AWS[@]}" iam get-instance-profile --instance-profile-name "${pname}"
+
+    roles=$(capture "${AWS[@]}" iam get-instance-profile --instance-profile-name "${pname}" \
+              --query 'InstanceProfile.Roles[].RoleName' --output text | tr '\t' '\n' | sort -u)
+    while read -r role; do
+      [[ -z "${role}" ]] && continue
+      run "  Role ${role}: trust policy"      "${AWS[@]}" iam get-role --role-name "${role}" --query 'Role.AssumeRolePolicyDocument'
+      run "  Role ${role}: attached policies" "${AWS[@]}" iam list-attached-role-policies --role-name "${role}"
+      run "  Role ${role}: inline policies"   "${AWS[@]}" iam list-role-policies --role-name "${role}"
+    done <<<"${roles}"
+  done <<<"${PROFILE_ARNS}"
+fi
+
+run "Candidate pre-existing CloudWatch/SSM roles (name match)" \
+  "${AWS[@]}" iam list-roles \
+    --query 'Roles[?contains(RoleName,`CLOUDWATCH`)||contains(RoleName,`CloudWatch`)||contains(RoleName,`SSM`)||contains(RoleName,`Ssm`)].{Name:RoleName,Created:CreateDate}' \
+    --output table
+
+# --------------------------------------------------------------- 4. ssm ----
+section "4. SYSTEMS MANAGER"
+run "SSM-managed instances (agent version, ping status, platform)" \
+  "${AWS[@]}" ssm describe-instance-information \
+    --query 'InstanceInformationList[].{Id:InstanceId,Ping:PingStatus,Agent:AgentVersion,Platform:PlatformName,Version:PlatformVersion,Name:ComputerName}' \
+    --output table
+
+echo -e "\n--- EC2 instances NOT registered with SSM (these cannot be targeted by Run Command)" >>"${OUT}"
+comm -23 \
+  <(capture "${AWS[@]}" ec2 describe-instances --filters Name=instance-state-name,Values=running \
+      --query 'Reservations[].Instances[].InstanceId' --output text | tr '\t' '\n' | sort -u) \
+  <(capture "${AWS[@]}" ssm describe-instance-information \
+      --query 'InstanceInformationList[].InstanceId' --output text | tr '\t' '\n' | sort -u) \
+  >>"${OUT}" 2>&1 || echo "[comparison failed]" >>"${OUT}"
+
+run "Existing AmazonCloudWatch-* parameters" \
+  "${AWS[@]}" ssm describe-parameters \
+    --parameter-filters 'Key=Name,Option=BeginsWith,Values=AmazonCloudWatch-' \
+    --query 'Parameters[].{Name:Name,Type:Type,Modified:LastModifiedDate}' --output table
+
+run "All parameters (names only — check for an existing agent config convention)" \
+  "${AWS[@]}" ssm describe-parameters --query 'Parameters[].Name' --output text
+
+run "Existing State Manager associations" \
+  "${AWS[@]}" ssm list-associations \
+    --query 'Associations[].{Name:Name,AssocId:AssociationId,Targets:Targets,Status:Overview.Status}' --output json
+
+run "CloudWatch agent Distributor package availability" \
+  "${AWS[@]}" ssm describe-document --name AmazonCloudWatchAgent \
+    --query '{Name:Document.Name,Status:Document.Status,Type:Document.DocumentType}'
+
+# --------------------------------------------- 5. existing cw agent state ----
+section "5. EXISTING CLOUDWATCH METRICS"
+for ns in ${METRIC_NAMESPACES}; do
+  run "Namespace ${ns}: metric names present" \
+    "${AWS[@]}" cloudwatch list-metrics --namespace "${ns}" \
+      --query 'Metrics[].MetricName' --output text
+  run "Namespace ${ns}: memory metrics with full dimensions" \
+    "${AWS[@]}" cloudwatch list-metrics --namespace "${ns}" \
+      --query 'Metrics[?contains(MetricName,`mem`)||contains(MetricName,`Memory`)||contains(MetricName,`memory`)]' \
+      --output json
+done
+
+run "Does any instance already publish mem_used_percent with InstanceId?" \
+  "${AWS[@]}" cloudwatch list-metrics --namespace CWAgent --metric-name mem_used_percent \
+    --query 'Metrics[].Dimensions' --output json
+
+# ------------------------------------------------------------ 6. network ----
+section "6. NETWORKING — SSM AND CLOUDWATCH REACHABILITY"
+run "VPC endpoints (need ssm, ssmmessages, ec2messages, monitoring for private subnets)" \
+  "${AWS[@]}" ec2 describe-vpc-endpoints \
+    --query 'VpcEndpoints[].{Vpc:VpcId,Service:ServiceName,Type:VpcEndpointType,State:State}' --output table
+
+run "NAT gateways" \
+  "${AWS[@]}" ec2 describe-nat-gateways \
+    --query 'NatGateways[].{Id:NatGatewayId,Vpc:VpcId,Subnet:SubnetId,State:State}' --output table
+
+# ---------------------------------------------------------------- 7. eks ----
+section "7. EKS"
+run "Clusters" "${AWS[@]}" eks list-clusters
+
+CLUSTERS=$(capture "${AWS[@]}" eks list-clusters --query 'clusters[]' --output text | tr '\t' '\n')
+while read -r c; do
+  [[ -z "${c}" ]] && continue
+  run "Cluster ${c}" "${AWS[@]}" eks describe-cluster --name "${c}" \
+    --query 'cluster.{Name:name,Version:version,Status:status,Endpoint:endpoint,Oidc:identity.oidc.issuer}'
+  run "Cluster ${c}: addons" "${AWS[@]}" eks list-addons --cluster-name "${c}"
+  run "Cluster ${c}: amazon-cloudwatch-observability addon" \
+    "${AWS[@]}" eks describe-addon --cluster-name "${c}" --addon-name amazon-cloudwatch-observability
+  run "Cluster ${c}: pod identity associations" \
+    "${AWS[@]}" eks list-pod-identity-associations --cluster-name "${c}"
+  run "Cluster ${c}: nodegroups" "${AWS[@]}" eks list-nodegroups --cluster-name "${c}"
+
+  NGS=$(capture "${AWS[@]}" eks list-nodegroups --cluster-name "${c}" --query 'nodegroups[]' --output text | tr '\t' '\n')
+  while read -r ng; do
+    [[ -z "${ng}" ]] && continue
+    run "  Nodegroup ${ng}" "${AWS[@]}" eks describe-nodegroup --cluster-name "${c}" --nodegroup-name "${ng}" \
+      --query 'nodegroup.{Name:nodegroupName,Status:status,Types:instanceTypes,Scaling:scalingConfig,NodeRole:nodeRole,AmiType:amiType,Capacity:capacityType}'
+  done <<<"${NGS}"
+done <<<"${CLUSTERS}"
+
+# --------------------------------------------------------- 8. kubernetes ----
+section "8. KUBERNETES (in-cluster view)"
+if have kubectl; then
+  run "Nodes"                    kubectl get nodes -o wide
+  run "Node capacity/allocatable" kubectl get nodes -o custom-columns='NAME:.metadata.name,INSTANCE:.spec.providerID,CPU:.status.capacity.cpu,MEM:.status.capacity.memory,ALLOC_MEM:.status.allocatable.memory'
+  run "Namespace ${K8S_NAMESPACE} workloads" kubectl -n "${K8S_NAMESPACE}" get all
+  run "CloudWatch agent daemonset"           kubectl -n "${K8S_NAMESPACE}" get daemonset -o wide
+  run "ConfigMaps in ${K8S_NAMESPACE}"       kubectl -n "${K8S_NAMESPACE}" get configmap
+  run "Agent config (CR from the addon operator)" kubectl get amazoncloudwatchagents -A -o yaml
+  run "Service accounts in ${K8S_NAMESPACE}" kubectl -n "${K8S_NAMESPACE}" get sa -o yaml
+  run "Node metrics (if metrics-server present)" kubectl top nodes
+else
+  echo -e "\n[kubectl not found on this host — skipping in-cluster checks]" >>"${OUT}"
+fi
+
+# --------------------------------------------------- 9. compute optimizer ----
+section "9. COMPUTE OPTIMIZER"
+run "Enrollment status" "${AWS[@]}" compute-optimizer get-enrollment-status
+run "EC2 recommendation summaries" "${AWS[@]}" compute-optimizer get-recommendation-summaries --output json
+run "Per-instance findings (shows whether memory data is seen)" \
+  "${AWS[@]}" compute-optimizer get-ec2-instance-recommendations \
+    --query 'instanceRecommendations[].{Arn:instanceArn,Finding:finding,Reasons:findingReasonCodes,Metrics:utilizationMetrics[].name}' \
+    --output json
+
+# ------------------------------------------------- 10. local agent state ----
+section "10. LOCAL HOST — IS AN AGENT ALREADY INSTALLED HERE?"
+run "Agent control status" /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a status
+run "Agent package (rpm)"  rpm -q amazon-cloudwatch-agent
+run "Agent config on disk" ls -la /opt/aws/amazon-cloudwatch-agent/etc/
+run "SSM agent status"     systemctl status amazon-ssm-agent --no-pager
+run "Memory on this host"  free -m
+
+# ----------------------------------------------------------------- done ----
+section "END"
+echo "Discovery complete." >>"${OUT}"
+
+echo
+echo "Output written to: ${OUT}"
+echo "Size: $(wc -l <"${OUT}") lines"
+echo
+echo "Review it for anything HCL considers sensitive before sharing."
+echo "Account IDs, instance IDs, VPC/subnet IDs and cluster endpoints are present."
