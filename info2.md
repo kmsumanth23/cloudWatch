@@ -1,3 +1,52 @@
+Subject: HXSA test (491004314536) — IAM prerequisite for CloudWatch Agent, single test VM
+
+Hi team,
+
+Following the approved change request "Install CloudWatch agent for memory
+utilisation metrics — HXSA", I need one IAM prerequisite before I can begin
+testing. Raising it separately as it is IAM work rather than the install itself.
+
+This request covers ONE instance only — our test VM. Once the install is
+validated there, I will raise a follow-up for the remaining hosts.
+
+BACKGROUND
+
+The change enables memory utilisation collection so EC2 right-sizing decisions
+can account for memory as well as CPU. It is read-only monitoring: the agent
+publishes metrics to CloudWatch and changes nothing on the instance.
+
+Two things currently block it:
+
+  1. The instance has no IAM instance profile attached.
+  2. Consequently it is not registered with Systems Manager, so SSM Run Command
+     cannot reach it. (`ssm describe-instance-information` currently returns
+     empty for the whole account.)
+
+TARGET INSTANCE
+
+    Instance ID   i-051a3ed2c30e1e36d
+    Name          duusea1ahxsautlbst3001
+    Type          t2.large
+    Account       491004314536
+    Region        us-east-1
+
+WHAT I NEED
+
+We can reuse the existing HCLSW_AWS_CLOUDWATCH_FULLACCESS_ROLE. Its trust
+policy already includes ec2.amazonaws.com, so no trust change is required.
+What it lacks is an instance profile and two managed policies.
+
+  Step 1 — attach two AWS managed policies to the existing role
+
+    aws iam attach-role-policy \
+      --role-name HCLSW_AWS_CLOUDWATCH_FULLACCESS_ROLE \
+      --policy-arn arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+
+    aws iam attach-role-policy \
+      --role-name HCLSW_AWS_CLOUDWATCH_FULLACCESS_ROLE \
+      --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  Step 2 — create an instance profile and add the role to it
   The role currently has no instance profile — `list-instance-profiles-for-role`
   returns an empty list — so one has to be created before the role can be used
   by an EC2 instance.
