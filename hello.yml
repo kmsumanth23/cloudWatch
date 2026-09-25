@@ -6,3 +6,52 @@ aws iam simulate-principal-policy --profile srvchxsa \
 aws iam get-role --profile srvchxsa \
   --role-name HCLSW_AWS_CLOUDWATCH_FULLACCESS_ROLE \
   --query 'Role.AssumeRolePolicyDocument'
+
+P="--profile srvchxsa"
+VM=i-051a3ed2c30e1e36d
+S=$(date -u -d '3 hours ago' +%Y-%m-%dT%H:%M:%SZ)
+E=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+aws cloudwatch get-metric-statistics $P \
+  --namespace AWS/EC2 --metric-name CPUUtilization \
+  --dimensions Name=InstanceId,Value=$VM \
+  --start-time $S --end-time $E --period 300 \
+  --statistics Average --query 'length(Datapoints)'
+
+aws cloudwatch list-metrics $P --namespace CWAgent --query 'length(Metrics)'
+
+aws cloudwatch get-metric-statistics $P \
+  --namespace CWAgent --metric-name mem_used_percent \
+  --dimensions Name=InstanceId,Value=$VM \
+  --start-time $S --end-time $E --period 300 \
+  --statistics Average --query 'Datapoints'
+
+# how many nodes it reports memory for
+aws cloudwatch list-metrics $P --namespace ContainerInsights \
+  --metric-name node_memory_utilization --query 'length(Metrics)'
+
+# which instances those are
+aws cloudwatch list-metrics $P --namespace ContainerInsights \
+  --metric-name node_memory_utilization \
+  --query 'Metrics[].Dimensions[?Name==`InstanceId`].Value' --output text
+
+# is my test VM among them?
+aws cloudwatch list-metrics $P --namespace ContainerInsights \
+  --metric-name node_memory_utilization \
+  --dimensions Name=InstanceId,Value=$VM --query 'length(Metrics)'
+
+for i in i-05c918b7107b2a6e0 i-0571a1ad142aef15b i-0a1199a48c61b870d \
+         i-0e19e77dfe3145ab0 i-051a3ed2c30e1e36d i-047cf06c8782f7fdd \
+         i-02a0c02b5ec8aa243 i-08599c683d445dc85; do
+  cw=$(aws cloudwatch list-metrics $P --namespace CWAgent \
+        --dimensions Name=InstanceId,Value=$i --query 'length(Metrics)' --output text)
+  ci=$(aws cloudwatch list-metrics $P --namespace ContainerInsights \
+        --dimensions Name=InstanceId,Value=$i --query 'length(Metrics)' --output text)
+  printf '%-22s CWAgent=%-4s ContainerInsights=%-4s\n' "$i" "$cw" "$ci"
+done
+
+for i in i-0c9e59d32f1ae395f i-098642c01c1a544a3; do
+  ci=$(aws cloudwatch list-metrics $P --namespace ContainerInsights \
+        --dimensions Name=InstanceId,Value=$i --query 'length(Metrics)' --output text)
+  printf '%-22s ContainerInsights=%-4s\n' "$i" "$ci"
+done
