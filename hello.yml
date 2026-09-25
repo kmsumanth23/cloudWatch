@@ -38,8 +38,50 @@ aws ec2 associate-iam-instance-profile $P \
   --instance-id $VM \
   --iam-instance-profile Name=$PROF
 
-aws iam create-instance-profile $P --instance-profile-name $R
-aws iam add-role-to-instance-profile $P --instance-profile-name $R --role-name $R
-sleep 10   # IAM propagation
-aws ec2 associate-iam-instance-profile $P \
-  --instance-id $VM --iam-instance-profile Name=$R
+
+
+VM=i-051a3ed2c30e1e36d
+aws cloudwatch put-metric-data \
+  --namespace CWAgentPreflight --metric-name preflight \
+  --dimensions InstanceId=$VM --value 1 --region us-east-1
+
+aws cloudwatch list-metrics --profile srvchxsa \
+  --namespace CWAgentPreflight --query 'length(Metrics)'
+
+cd /tmp
+curl -O https://amazoncloudwatch-agent-us-east-1.s3.us-east-1.amazonaws.com/redhat/amd64/latest/amazon-cloudwatch-agent.rpm
+rpm -U ./amazon-cloudwatch-agent.rpm
+
+tee /opt/aws/amazon-cloudwatch-agent/etc/cwagent-memory.json > /dev/null <<'EOF'
+{
+  "agent": {
+    "metrics_collection_interval": 60,
+    "run_as_user": "cwagent",
+    "debug": false
+  },
+  "metrics": {
+    "namespace": "CWAgent",
+    "append_dimensions": { "InstanceId": "${aws:InstanceId}" },
+    "aggregation_dimensions": [["InstanceId"]],
+    "metrics_collected": {
+      "mem": {
+        "measurement": [{ "name": "mem_used_percent", "unit": "Percent" }],
+        "metrics_collection_interval": 60
+      }
+    }
+  }
+}
+EOF
+
+/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+  -a fetch-config -m ec2 -s \
+  -c file:/opt/aws/amazon-cloudwatch-agent/etc/cwagent-memory.json
+
+/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a status
+
+
+aws cloudwatch list-metrics --profile srvchxsa --namespace CWAgent \
+  --metric-name mem_used_percent \
+  --dimensions Name=InstanceId,Value=$VM
+
+free -m    # compare against the datapoint
