@@ -28,3 +28,18 @@ aws cloudwatch list-metrics $P --namespace CWAgentPreflight --query 'length(Metr
 P="--profile srvchxsa"
 R=HCLSW_AWS_HXSA_EC2_CLOUDWATCH_FULLACCESS_SVC_ROLE
 VM=i-051a3ed2c30e1e36d
+
+
+---
+
+PROF=<name-from-above>
+
+aws ec2 associate-iam-instance-profile $P \
+  --instance-id $VM \
+  --iam-instance-profile Name=$PROF
+
+aws iam create-instance-profile $P --instance-profile-name $R
+aws iam add-role-to-instance-profile $P --instance-profile-name $R --role-name $R
+sleep 10   # IAM propagation
+aws ec2 associate-iam-instance-profile $P \
+  --instance-id $VM --iam-instance-profile Name=$R
