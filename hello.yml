@@ -1,78 +1,26 @@
-aws iam simulate-principal-policy --profile srvchxsa \
-  --policy-source-arn arn:aws:iam::491004314536:role/HCLSW_AWS_SAAS_SVC_ADMIN_ROLE \
-  --action-names ssm:PutParameter ssm:SendCommand ssm:ListCommandInvocations \
-  --query 'EvaluationResults[].[EvalActionName,EvalDecision]' --output text
+aws iam get-role $P --role-name $R --query 'Role.AssumeRolePolicyDocument'
 
-aws iam get-role --profile srvchxsa \
-  --role-name HCLSW_AWS_CLOUDWATCH_FULLACCESS_ROLE \
-  --query 'Role.AssumeRolePolicyDocument'
+aws iam list-attached-role-policies $P --role-name $R --output text
 
-P="--profile srvchxsa"
-VM=i-051a3ed2c30e1e36d
-S=$(date -u -d '3 hours ago' +%Y-%m-%dT%H:%M:%SZ)
-E=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+aws iam list-instance-profiles-for-role $P --role-name $R \
+  --query 'InstanceProfiles[].InstanceProfileName' --output text
 
-aws cloudwatch get-metric-statistics $P \
-  --namespace AWS/EC2 --metric-name CPUUtilization \
-  --dimensions Name=InstanceId,Value=$VM \
-  --start-time $S --end-time $E --period 300 \
-  --statistics Average --query 'length(Datapoints)'
+aws ec2 describe-instances $P --instance-ids $VM \
+  --query 'Reservations[].Instances[].IamInstanceProfile' --output json
 
-aws cloudwatch list-metrics $P --namespace CWAgent --query 'length(Metrics)'
+TOKEN=$(curl -sX PUT "http://169.254.169.254/latest/api/token" \
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
+curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+  http://169.254.169.254/latest/meta-data/iam/security-credentials/
 
-aws cloudwatch get-metric-statistics $P \
-  --namespace CWAgent --metric-name mem_used_percent \
-  --dimensions Name=InstanceId,Value=$VM \
-  --start-time $S --end-time $E --period 300 \
-  --statistics Average --query 'Datapoints'
+env -u AWS_PROFILE -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY \
+    -u AWS_SESSION_TOKEN -u AWS_CONFIG_FILE -u AWS_SHARED_CREDENTIALS_FILE \
+    HOME=$(mktemp -d) aws sts get-caller-identity --region us-east-1
 
-# how many nodes it reports memory for
-aws cloudwatch list-metrics $P --namespace ContainerInsights \
-  --metric-name node_memory_utilization --query 'length(Metrics)'
+env -u AWS_PROFILE -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY \
+    -u AWS_SESSION_TOKEN -u AWS_CONFIG_FILE -u AWS_SHARED_CREDENTIALS_FILE \
+    HOME=$(mktemp -d) aws cloudwatch put-metric-data \
+    --namespace CWAgentPreflight --metric-name preflight \
+    --dimensions InstanceId=$VM --value 1 --region us-east-1
 
-# which instances those are
-aws cloudwatch list-metrics $P --namespace ContainerInsights \
-  --metric-name node_memory_utilization \
-  --query 'Metrics[].Dimensions[?Name==`InstanceId`].Value' --output text
-
-# is my test VM among them?
-aws cloudwatch list-metrics $P --namespace ContainerInsights \
-  --metric-name node_memory_utilization \
-  --dimensions Name=InstanceId,Value=$VM --query 'length(Metrics)'
-
-for i in i-05c918b7107b2a6e0 i-0571a1ad142aef15b i-0a1199a48c61b870d \
-         i-0e19e77dfe3145ab0 i-051a3ed2c30e1e36d i-047cf06c8782f7fdd \
-         i-02a0c02b5ec8aa243 i-08599c683d445dc85; do
-  cw=$(aws cloudwatch list-metrics $P --namespace CWAgent \
-        --dimensions Name=InstanceId,Value=$i --query 'length(Metrics)' --output text)
-  ci=$(aws cloudwatch list-metrics $P --namespace ContainerInsights \
-        --dimensions Name=InstanceId,Value=$i --query 'length(Metrics)' --output text)
-  printf '%-22s CWAgent=%-4s ContainerInsights=%-4s\n' "$i" "$cw" "$ci"
-done
-
-for i in i-0c9e59d32f1ae395f i-098642c01c1a544a3; do
-  ci=$(aws cloudwatch list-metrics $P --namespace ContainerInsights \
-        --dimensions Name=InstanceId,Value=$i --query 'length(Metrics)' --output text)
-  printf '%-22s ContainerInsights=%-4s\n' "$i" "$ci"
-done
-
-# Does ContainerInsights have ANY metrics, or is it completely empty?
-aws cloudwatch list-metrics $P --namespace ContainerInsights --query 'length(Metrics)'
-
-# Are the agent pods even running?
-kubectl -n amazon-cloudwatch get pods
-
-# The answer is almost certainly in here — look for AccessDenied on PutMetricData
-kubectl -n amazon-cloudwatch logs -l app.kubernetes.io/name=cloudwatch-agent \
-  --tail=50 --max-log-requests=3 2>&1 | grep -iE "denied|error|credential|forbidden"
-
-# Is IAM wired up for the agent's service account?
-kubectl -n amazon-cloudwatch get sa cloudwatch-agent -o yaml | grep -A2 annotations
-aws eks list-pod-identity-associations $P --cluster-name eks-hxsa-d-us-east-1-3
-
-# Does the EKS node role have the policy the agent needs?
-aws iam get-instance-profile $P \
-  --instance-profile-name eks-20cc6696-3655-378b-19a6-f0991c01bb3c \
-  --query 'InstanceProfile.Roles[].RoleName' --output text
-# then, with that role name:
-aws iam list-attached-role-policies $P --role-name <role-from-above>
+aws cloudwatch list-metrics $P --namespace CWAgentPreflight --query 'length(Metrics)'
