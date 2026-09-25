@@ -1,26 +1,8 @@
-P="--profile srvchxsa"
+aws iam simulate-principal-policy --profile srvchxsa \
+  --policy-source-arn arn:aws:iam::491004314536:role/HCLSW_AWS_SAAS_SVC_ADMIN_ROLE \
+  --action-names ssm:PutParameter ssm:SendCommand ssm:ListCommandInvocations \
+  --query 'EvaluationResults[].[EvalActionName,EvalDecision]' --output text
 
-# 1. What EC2 exists, and which are EKS nodes (4th column = cluster tag, None = standalone)
-aws ec2 describe-instances $P \
-  --filters Name=instance-state-name,Values=running \
-  --query 'Reservations[].Instances[].[InstanceId,Tags[?Key==`Name`]|[0].Value,InstanceType,Tags[?Key==`eks:cluster-name`]|[0].Value,IamInstanceProfile.Arn]' \
-  --output text
-
-# 2. Which of them can SSM actually reach
-aws ssm describe-instance-information $P \
-  --query 'InstanceInformationList[].[InstanceId,PingStatus,AgentVersion,PlatformName]' \
-  --output text
-
-# 3. Is anything already publishing memory to CWAgent
-aws cloudwatch list-metrics $P --namespace CWAgent --metric-name mem_used_percent \
-  --query 'Metrics[].Dimensions' --output json
-
-# 4. Compute Optimizer on or off
-aws compute-optimizer get-enrollment-status $P
-
-# Is memory data already flowing for the expensive 16?
-aws cloudwatch list-metrics $P --namespace ContainerInsights \
-  --query 'Metrics[?MetricName==`node_memory_utilization`].Dimensions' --output json
-
-# Is SSM Agent even installed locally, or is it an install + IAM problem?
-systemctl status amazon-ssm-agent --no-pager 2>&1 | head -5; rpm -q amazon-ssm-agent
+aws iam get-role --profile srvchxsa \
+  --role-name HCLSW_AWS_CLOUDWATCH_FULLACCESS_ROLE \
+  --query 'Role.AssumeRolePolicyDocument'
