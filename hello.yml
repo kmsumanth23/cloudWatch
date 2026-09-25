@@ -55,3 +55,24 @@ for i in i-0c9e59d32f1ae395f i-098642c01c1a544a3; do
         --dimensions Name=InstanceId,Value=$i --query 'length(Metrics)' --output text)
   printf '%-22s ContainerInsights=%-4s\n' "$i" "$ci"
 done
+
+# Does ContainerInsights have ANY metrics, or is it completely empty?
+aws cloudwatch list-metrics $P --namespace ContainerInsights --query 'length(Metrics)'
+
+# Are the agent pods even running?
+kubectl -n amazon-cloudwatch get pods
+
+# The answer is almost certainly in here — look for AccessDenied on PutMetricData
+kubectl -n amazon-cloudwatch logs -l app.kubernetes.io/name=cloudwatch-agent \
+  --tail=50 --max-log-requests=3 2>&1 | grep -iE "denied|error|credential|forbidden"
+
+# Is IAM wired up for the agent's service account?
+kubectl -n amazon-cloudwatch get sa cloudwatch-agent -o yaml | grep -A2 annotations
+aws eks list-pod-identity-associations $P --cluster-name eks-hxsa-d-us-east-1-3
+
+# Does the EKS node role have the policy the agent needs?
+aws iam get-instance-profile $P \
+  --instance-profile-name eks-20cc6696-3655-378b-19a6-f0991c01bb3c \
+  --query 'InstanceProfile.Roles[].RoleName' --output text
+# then, with that role name:
+aws iam list-attached-role-policies $P --role-name <role-from-above>
