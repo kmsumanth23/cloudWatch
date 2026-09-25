@@ -24,3 +24,7 @@ env -u AWS_PROFILE -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY \
     --dimensions InstanceId=$VM --value 1 --region us-east-1
 
 aws cloudwatch list-metrics $P --namespace CWAgentPreflight --query 'length(Metrics)'
+
+P="--profile srvchxsa"
+R=HCLSW_AWS_HXSA_EC2_CLOUDWATCH_FULLACCESS_SVC_ROLE
+VM=i-051a3ed2c30e1e36d
