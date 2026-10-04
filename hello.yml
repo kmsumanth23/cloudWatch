@@ -85,3 +85,8 @@ aws cloudwatch list-metrics --profile srvchxsa --namespace CWAgent \
   --dimensions Name=InstanceId,Value=$VM
 
 free -m    # compare against the datapoint
+
+
+for h in 10.x.x.x 10.x.x.y ...; do
+  ssh -o BatchMode=yes -o ConnectTimeout=5 $h 'hostname; cat /etc/os-release | grep PRETTY'
+done
