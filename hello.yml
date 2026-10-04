@@ -87,6 +87,9 @@ aws cloudwatch list-metrics --profile srvchxsa --namespace CWAgent \
 free -m    # compare against the datapoint
 
 
-for h in 10.x.x.x 10.x.x.y ...; do
-  ssh -o BatchMode=yes -o ConnectTimeout=5 $h 'hostname; cat /etc/os-release | grep PRETTY'
-done
+aws ec2 describe-instances --profile srvchxsa \
+  --instance-ids i-05c918b7107b2a6e0 i-0571a1ad142aef15b i-0a1199a48c61b870d \
+                 i-0e19e77dfe3145ab0 i-047cf06c8782f7fdd i-02a0c02b5ec8aa243 \
+                 i-08599c683d445dc85 \
+  --query 'Reservations[].Instances[].[InstanceId,PrivateIpAddress,PrivateDnsName,Tags[?Key==`Name`]|[0].Value]' \
+  --output text
