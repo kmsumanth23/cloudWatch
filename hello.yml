@@ -93,3 +93,49 @@ aws ec2 describe-instances --profile srvchxsa \
                  i-08599c683d445dc85 \
   --query 'Reservations[].Instances[].[InstanceId,PrivateIpAddress,PrivateDnsName,Tags[?Key==`Name`]|[0].Value]' \
   --output text
+
+
+
+flowchart LR
+    subgraph control["Control node (AWX / bastion)"]
+        V["Client env vars<br/>vsi_instances"]
+        P["Ansible playbook<br/>cloudwatch-agent.yml"]
+    end
+
+    subgraph aws["AWS account"]
+        API["EC2 + IAM API"]
+        EC2["EC2 instance<br/>CloudWatch agent"]
+        CW["CloudWatch<br/>CWAgent namespace"]
+    end
+
+    V --> P
+    P -->|"discover + associate profile"| API
+    P -->|"SSH: install, configure, start"| EC2
+    EC2 -->|"PutMetricData"| CW
+    P -->|"verify datapoints"| CW
+
+flowchart TD
+    A["1. Preflight<br/>profile name set?"] --> B["2. Discover<br/>vsi_instances flag to EC2"]
+    B --> C["3. IAM<br/>associate profile if absent"]
+    C --> D["4. Facts<br/>OS family per host"]
+    D --> E["5. Install<br/>agent package"]
+    E --> F["6. Configure<br/>render config, start agent"]
+    F --> G["7. Verify<br/>datapoints in CloudWatch"]
+    G --> H["Done"]
+
+    C -.->|"instance has a different profile"| X["STOP"]
+    G -.->|"no datapoints"| X
+
+flowchart LR
+    subgraph iam["IAM team (prerequisite)"]
+        R["Create role<br/>CloudWatchAgentServerPolicy"]
+        IP["Create instance profile"]
+    end
+
+    subgraph auto["Automation"]
+        AS["Associate profile<br/>to instance"]
+        IN["Install + configure agent"]
+        VF["Verify metrics"]
+    end
+
+    R --> IP --> AS --> IN --> VF
