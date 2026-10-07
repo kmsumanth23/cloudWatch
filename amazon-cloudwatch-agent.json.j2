@@ -1,0 +1,20 @@
+{
+  "agent": {
+    "metrics_collection_interval": {{ cloudwatch_agent_interval | int }},
+    "run_as_user": "{{ cloudwatch_agent_run_as_user }}",
+    "debug": {{ cloudwatch_agent_debug | bool | to_json }}
+  },
+  "metrics": {
+    "namespace": "{{ cloudwatch_agent_namespace }}",
+    "append_dimensions": {{ cloudwatch_agent_append_dimensions | to_json }},
+    "aggregation_dimensions": {{ cloudwatch_agent_aggregation_dimensions | to_json }},
+    "metrics_collected": {
+{% for group, cfg in cloudwatch_agent_metrics_collected.items() %}
+      "{{ group }}": {
+        "measurement": {{ cfg.measurement | to_json }},
+        "metrics_collection_interval": {{ cfg.interval | default(cloudwatch_agent_interval) | int }}
+      }{{ "," if not loop.last else "" }}
+{% endfor %}
+    }
+  }
+}

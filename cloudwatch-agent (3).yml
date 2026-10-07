@@ -1,0 +1,37 @@
+---
+# CloudWatch agent memory monitoring — single play, end to end.
+#
+# Prerequisite, owned by the IAM team and NOT performed here:
+#   a role trusting ec2.amazonaws.com with CloudWatchAgentServerPolicy
+#   attached, and an instance profile containing that role.
+#   Set cloudwatch_instance_profile_name to that profile.
+#
+# Run:
+#   ansible-playbook cloudwatch-agent.yml \
+#     -e cloudwatch_defaults_file=<default_var_dir>/cloudwatch.yml
+#
+# Dry run (discovery and reporting only):
+#   ansible-playbook cloudwatch-agent.yml --check --diff
+
+- name: CloudWatch agent memory monitoring
+  hosts: "{{ cloudwatch_control_host | default('localhost') }}"
+  connection: local
+  gather_facts: false
+
+  # vars_files, not include_vars: these are DEFAULTS and must sit below the
+  # client environment vars file in precedence. include_vars (prec. 18) would
+  # override anything the orchestrator had already loaded, silently discarding
+  # client overrides. vars_files is prec. 14, so include_vars, task vars and
+  # -e all still win.
+  vars_files:
+    - "{{ cloudwatch_defaults_file | default('defaults/cloudwatch.yml') }}"
+
+  tasks:
+    - name: Install and configure the CloudWatch agent on all targets
+      ansible.builtin.include_tasks:
+        file: tasks/cloudwatch-agent.yml
+        apply:
+          tags:
+            - cw-agent
+      tags:
+        - cw-agent

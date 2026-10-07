@@ -1,0 +1,562 @@
+---
+# CloudWatch agent memory monitoring — all phases.
+#
+# Runs on the control node. Target hosts are reached with delegate_to, because
+# add_host does not affect the current play's host list and this repo uses
+# single-play playbooks. Consequence: host work is serial, and one failing host
+# is isolated with cloudwatch_fail_fast=false rather than by Ansible's
+# per-host error handling.
+
+# ---------------------------------------------------------------- preflight --
+- name: Assert the instance profile name has been configured
+  tags:
+    - cw-agent
+  ansible.builtin.assert:
+    that:
+      - cloudwatch_instance_profile_name | length > 0
+    fail_msg: >-
+      cloudwatch_instance_profile_name is not set. The IAM role and instance
+      profile are a prerequisite created by the IAM team; set the profile name
+      in the client environment vars file before running this.
+    quiet: true
+
+# ----------------------------------------------------------------- discover --
+- name: Select vsi_instances entries flagged for the CloudWatch agent
+  tags:
+    - cw-agent
+  ansible.builtin.set_fact:
+    cloudwatch_vsi_selected: >-
+      {{ vsi_instances | default([])
+         | selectattr(cloudwatch_vsi_flag, 'defined')
+         | selectattr(cloudwatch_vsi_flag) | list }}
+  when: cloudwatch_discovery_mode == 'vsi_vars'
+
+# Derives the Name-tag suffix each selected entry produces, one per instance in
+# instance_count. Convention observed in this estate:
+#   <prefix><client_code><stack><type><env_seq><instance_seq padded to 3>
+#   e.g. duusea1ahxsautlbst3001  ->  *hxsautlbst3001
+# The prefix is deliberately not derived; the pattern is anchored on the suffix.
+# Override cloudwatch_vsi_name_patterns directly if the convention differs.
+- name: Build Name tag patterns from the selected entries
+  tags:
+    - cw-agent
+  ansible.builtin.set_fact:
+    cloudwatch_vsi_name_patterns: >-
+      {%- set out = [] -%}
+      {%- for e in cloudwatch_vsi_selected -%}
+      {%-   for n in range(e.instance_seq | int,
+                           (e.instance_seq | int) + (e.instance_count | default(1) | int)) -%}
+      {%-     set _ = out.append('*' ~ client_code ~ e.stack ~ e.type ~ env_seq ~ ('%03d' | format(n))) -%}
+      {%-   endfor -%}
+      {%- endfor -%}
+      {{ out | to_json }}
+  when:
+    - cloudwatch_discovery_mode == 'vsi_vars'
+    - cloudwatch_vsi_name_patterns is not defined
+
+- name: Report the derived name patterns
+  tags:
+    - cw-agent
+  ansible.builtin.debug:
+    msg: >-
+      {{ cloudwatch_vsi_selected | length }} vsi_instances entries flagged
+      '{{ cloudwatch_vsi_flag }}' ->
+      {{ (cloudwatch_vsi_name_patterns | from_json
+          if cloudwatch_vsi_name_patterns is string
+          else cloudwatch_vsi_name_patterns) | join(' ') }}
+  when: cloudwatch_discovery_mode == 'vsi_vars'
+
+- name: Assert the selection produced at least one name pattern
+  tags:
+    - cw-agent
+  ansible.builtin.assert:
+    that:
+      - cloudwatch_vsi_name_patterns | length > 0
+    fail_msg: >-
+      No vsi_instances entry in this environment carries
+      {{ cloudwatch_vsi_flag }}: true. Add the flag to the entries that should
+      run the CloudWatch agent, in the client environment vars file.
+    quiet: true
+  when: cloudwatch_discovery_mode == 'vsi_vars'
+
+- name: Discover target instances from vsi_instances name patterns
+  tags:
+    - cw-agent
+  ansible.builtin.command:
+    argv:
+      - aws
+      - ec2
+      - describe-instances
+      - --region
+      - "{{ cloudwatch_region }}"
+      - --filters
+      - >-
+        Name=tag:Name,Values={{ (cloudwatch_vsi_name_patterns | from_json
+                                 if cloudwatch_vsi_name_patterns is string
+                                 else cloudwatch_vsi_name_patterns) | join(',') }}
+      - "Name=instance-state-name,Values=running"
+      - --query
+      - >-
+        Reservations[].Instances[].{id:InstanceId,ip:PrivateIpAddress,
+        dns:PrivateDnsName,name:Tags[?Key=='Name']|[0].Value,
+        profile:IamInstanceProfile.Arn}
+      - --output
+      - json
+  environment: "{{ cloudwatch_aws_cli_env }}"
+  register: cloudwatch_vsi_discovery
+  changed_when: false
+  when: cloudwatch_discovery_mode == 'vsi_vars'
+
+- name: Discover target instances by AWS tag
+  tags:
+    - cw-agent
+  ansible.builtin.command:
+    argv:
+      - aws
+      - ec2
+      - describe-instances
+      - --region
+      - "{{ cloudwatch_region }}"
+      - --filters
+      - "Name=tag:{{ cloudwatch_target_tag_key }},Values={{ cloudwatch_target_tag_value }}"
+      - "Name=instance-state-name,Values=running"
+      - --query
+      - >-
+        Reservations[].Instances[].{id:InstanceId,ip:PrivateIpAddress,
+        dns:PrivateDnsName,name:Tags[?Key=='Name']|[0].Value,
+        profile:IamInstanceProfile.Arn}
+      - --output
+      - json
+  environment: "{{ cloudwatch_aws_cli_env }}"
+  register: cloudwatch_discovery
+  changed_when: false
+  when: cloudwatch_discovery_mode == 'tag'
+
+- name: Describe explicitly listed target instances
+  tags:
+    - cw-agent
+  ansible.builtin.command:
+    argv: >-
+      {{ ['aws', 'ec2', 'describe-instances', '--region', cloudwatch_region,
+          '--instance-ids'] + cloudwatch_target_instances +
+         ['--query',
+          "Reservations[].Instances[].{id:InstanceId,ip:PrivateIpAddress,dns:PrivateDnsName,name:Tags[?Key=='Name']|[0].Value,profile:IamInstanceProfile.Arn}",
+          '--output', 'json'] }}
+  environment: "{{ cloudwatch_aws_cli_env }}"
+  register: cloudwatch_explicit
+  changed_when: false
+  when: cloudwatch_discovery_mode == 'explicit'
+
+- name: Normalise the target list
+  tags:
+    - cw-agent
+  ansible.builtin.set_fact:
+    cloudwatch_targets: >-
+      {{ (cloudwatch_explicit.stdout | from_json)
+         if cloudwatch_discovery_mode == 'explicit'
+         else (cloudwatch_vsi_discovery.stdout | from_json)
+              if cloudwatch_discovery_mode == 'vsi_vars'
+              else (cloudwatch_discovery.stdout | from_json) }}
+
+- name: Assert at least one target was found
+  tags:
+    - cw-agent
+  ansible.builtin.assert:
+    that:
+      - cloudwatch_targets | length > 0
+    fail_msg: >-
+      No running instances matched. Either tag the target instances with
+      {{ cloudwatch_target_tag_key }}={{ cloudwatch_target_tag_value }}, or set
+      cloudwatch_target_instances explicitly.
+    quiet: true
+
+- name: Assert every target has a private address to connect to
+  tags:
+    - cw-agent
+  ansible.builtin.assert:
+    that:
+      - item.ip is truthy
+    fail_msg: "{{ item.id }} has no private IP address; cannot be reached over SSH."
+    quiet: true
+  loop: "{{ cloudwatch_targets }}"
+  loop_control:
+    label: "{{ item.id }}"
+
+- name: Report the resolved target set
+  tags:
+    - cw-agent
+  ansible.builtin.debug:
+    msg: >-
+      {{ cloudwatch_targets | length }} target(s):
+      {{ cloudwatch_targets | map(attribute='id') | join(', ') }}
+
+# ---------------------------------------------------------------------- IAM --
+- name: Partition targets by instance profile state
+  tags:
+    - cw-agent
+  ansible.builtin.set_fact:
+    cloudwatch_profile_absent: "{{ cloudwatch_targets | rejectattr('profile') | list }}"
+    cloudwatch_profile_correct: >-
+      {{ cloudwatch_targets | selectattr('profile')
+         | selectattr('profile', 'search', cloudwatch_instance_profile_name) | list }}
+    cloudwatch_profile_conflict: >-
+      {{ cloudwatch_targets | selectattr('profile')
+         | rejectattr('profile', 'search', cloudwatch_instance_profile_name) | list }}
+
+- name: Refuse to replace an instance profile already in use
+  tags:
+    - cw-agent
+  ansible.builtin.assert:
+    that:
+      - cloudwatch_profile_conflict | length == 0
+    fail_msg: >-
+      These instances already carry a different instance profile:
+      {{ cloudwatch_profile_conflict | map(attribute='id') | join(', ') }}.
+      An instance can hold only one profile, so associating
+      {{ cloudwatch_instance_profile_name }} would remove the permissions the
+      workload is currently using. Resolve per instance, or set
+      cloudwatch_replace_existing_profile=true as a deliberate decision.
+    quiet: true
+  when: not cloudwatch_replace_existing_profile
+
+- name: Report instances already correctly associated
+  tags:
+    - cw-agent
+  ansible.builtin.debug:
+    msg: >-
+      Already associated, skipping:
+      {{ cloudwatch_profile_correct | map(attribute='id') | join(', ') }}
+  when: cloudwatch_profile_correct | length > 0
+
+- name: Associate the instance profile where absent
+  tags:
+    - cw-agent
+  ansible.builtin.command:
+    argv:
+      - aws
+      - ec2
+      - associate-iam-instance-profile
+      - --region
+      - "{{ cloudwatch_region }}"
+      - --instance-id
+      - "{{ item.id }}"
+      - --iam-instance-profile
+      - "Name={{ cloudwatch_instance_profile_name }}"
+  environment: "{{ cloudwatch_aws_cli_env }}"
+  register: cloudwatch_association
+  loop: "{{ cloudwatch_profile_absent }}"
+  loop_control:
+    label: "{{ item.id }}"
+  when: cloudwatch_associate_profile | bool
+
+- name: Record association ids for rollback
+  tags:
+    - cw-agent
+  ansible.builtin.debug:
+    msg: >-
+      {{ item.item.id }} -> association
+      {{ (item.stdout | from_json).IamInstanceProfileAssociation.AssociationId }}
+  loop: "{{ cloudwatch_association.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.id | default('skipped') }}"
+  when:
+    - item.stdout is defined
+    - item.stdout | length > 0
+
+- name: Allow IMDS credentials to propagate
+  tags:
+    - cw-agent
+  ansible.builtin.pause:
+    seconds: "{{ cloudwatch_profile_propagation_delay }}"
+  when:
+    - cloudwatch_associate_profile | bool
+    - cloudwatch_profile_absent | length > 0
+
+# ------------------------------------------------------------ target facts --
+- name: Gather distribution facts from targets
+  tags:
+    - cw-agent
+  ansible.builtin.setup:
+    gather_subset:
+      - '!all'
+      - '!min'
+      - distribution
+  delegate_to: "{{ item.ip }}"
+  vars:
+    ansible_connection: "{{ cloudwatch_target_connection }}"
+  delegate_facts: true
+  loop: "{{ cloudwatch_targets }}"
+  loop_control:
+    label: "{{ item.id }} ({{ item.ip }})"
+
+- name: Resolve the package URL for each target
+  tags:
+    - cw-agent
+  ansible.builtin.set_fact:
+    cloudwatch_target_os: >-
+      {{ cloudwatch_target_os | default({})
+         | combine({item.id: (cloudwatch_agent_os_family_override
+                              | default(hostvars[item.ip]['ansible_facts']['os_family'], true))}) }}
+  loop: "{{ cloudwatch_targets }}"
+  loop_control:
+    label: "{{ item.id }}"
+
+- name: Assert a package URL exists for every target's OS family
+  tags:
+    - cw-agent
+  ansible.builtin.assert:
+    that:
+      - cloudwatch_target_os[item.id] in cloudwatch_agent_package_urls
+    fail_msg: >-
+      {{ item.id }} reports OS family '{{ cloudwatch_target_os[item.id] }}',
+      which has no entry in cloudwatch_agent_package_urls.
+    quiet: true
+  loop: "{{ cloudwatch_targets }}"
+  loop_control:
+    label: "{{ item.id }} -> {{ cloudwatch_target_os[item.id] }}"
+
+# -------------------------------------------------------------------- install --
+- name: Install the CloudWatch agent (RHEL family)
+  tags:
+    - cw-agent
+  ansible.builtin.dnf:
+    name: "{{ cloudwatch_agent_package_urls['RedHat'] }}"
+    state: present
+    disable_gpg_check: "{{ cloudwatch_agent_disable_gpg_check | bool }}"
+  delegate_to: "{{ item.ip }}"
+  vars:
+    ansible_connection: "{{ cloudwatch_target_connection }}"
+  become: true
+  register: cloudwatch_install_rhel
+  failed_when:
+    - cloudwatch_install_rhel is failed
+    - cloudwatch_fail_fast | bool
+  loop: "{{ cloudwatch_targets }}"
+  loop_control:
+    label: "{{ item.id }}"
+  when: cloudwatch_target_os[item.id] == 'RedHat'
+
+- name: Install the CloudWatch agent (Debian family)
+  tags:
+    - cw-agent
+  ansible.builtin.apt:
+    deb: "{{ cloudwatch_agent_package_urls['Debian'] }}"
+  delegate_to: "{{ item.ip }}"
+  vars:
+    ansible_connection: "{{ cloudwatch_target_connection }}"
+  become: true
+  register: cloudwatch_install_deb
+  failed_when:
+    - cloudwatch_install_deb is failed
+    - cloudwatch_fail_fast | bool
+  loop: "{{ cloudwatch_targets }}"
+  loop_control:
+    label: "{{ item.id }}"
+  when: cloudwatch_target_os[item.id] == 'Debian'
+
+- name: Confirm the agent control binary is present
+  tags:
+    - cw-agent
+  ansible.builtin.stat:
+    path: "{{ cloudwatch_agent_root }}/bin/amazon-cloudwatch-agent-ctl"
+  delegate_to: "{{ item.ip }}"
+  vars:
+    ansible_connection: "{{ cloudwatch_target_connection }}"
+  become: true
+  register: cloudwatch_ctl
+  loop: "{{ cloudwatch_targets }}"
+  loop_control:
+    label: "{{ item.id }}"
+
+- name: Assert the agent installed on every target
+  tags:
+    - cw-agent
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+    fail_msg: >-
+      {{ item.item.id }}: package install reported success but
+      {{ cloudwatch_agent_root }}/bin/amazon-cloudwatch-agent-ctl is missing.
+    quiet: true
+  loop: "{{ cloudwatch_ctl.results }}"
+  loop_control:
+    label: "{{ item.item.id }}"
+
+# ------------------------------------------------------------------ configure --
+- name: Query current agent status
+  tags:
+    - cw-agent
+  ansible.builtin.command:
+    argv:
+      - "{{ cloudwatch_agent_root }}/bin/amazon-cloudwatch-agent-ctl"
+      - -a
+      - status
+  delegate_to: "{{ item.ip }}"
+  vars:
+    ansible_connection: "{{ cloudwatch_target_connection }}"
+  become: true
+  register: cloudwatch_agent_status
+  changed_when: false
+  failed_when: false
+  loop: "{{ cloudwatch_targets }}"
+  loop_control:
+    label: "{{ item.id }}"
+
+# The rendered config is identical on every host: ${aws:InstanceId} is resolved
+# by the agent from IMDS at startup, not templated here. Do not substitute a
+# literal instance id — it would make the file host-specific.
+- name: Deploy the agent configuration
+  tags:
+    - cw-agent
+  ansible.builtin.template:
+    src: amazon-cloudwatch-agent.json.j2
+    dest: "{{ cloudwatch_agent_root }}/etc/{{ cloudwatch_agent_config_filename }}"
+    owner: root
+    group: root
+    mode: "0644"
+    validate: "python3 -c \"import json,sys; json.load(open('%s'))\""
+  delegate_to: "{{ item.ip }}"
+  vars:
+    ansible_connection: "{{ cloudwatch_target_connection }}"
+  become: true
+  register: cloudwatch_config
+  loop: "{{ cloudwatch_targets }}"
+  loop_control:
+    label: "{{ item.id }}"
+
+- name: Apply the configuration and start the agent
+  tags:
+    - cw-agent
+  ansible.builtin.command:
+    argv:
+      - "{{ cloudwatch_agent_root }}/bin/amazon-cloudwatch-agent-ctl"
+      - -a
+      - fetch-config
+      - -m
+      - ec2
+      - -s
+      - -c
+      - "file:{{ cloudwatch_agent_root }}/etc/{{ cloudwatch_agent_config_filename }}"
+  delegate_to: "{{ item.ip }}"
+  vars:
+    ansible_connection: "{{ cloudwatch_target_connection }}"
+  become: true
+  loop: "{{ cloudwatch_targets }}"
+  loop_control:
+    label: "{{ item.id }}"
+    index_var: cw_idx
+  when: >-
+    cloudwatch_config.results[cw_idx].changed
+    or ('"status": "running"' not in (cloudwatch_agent_status.results[cw_idx].stdout | default('')))
+
+- name: Ensure the agent service is enabled and running
+  tags:
+    - cw-agent
+  ansible.builtin.systemd:
+    name: "{{ cloudwatch_agent_service }}"
+    enabled: true
+    state: started
+  delegate_to: "{{ item.ip }}"
+  vars:
+    ansible_connection: "{{ cloudwatch_target_connection }}"
+  become: true
+  loop: "{{ cloudwatch_targets }}"
+  loop_control:
+    label: "{{ item.id }}"
+
+- name: Re-read agent status after configuration
+  tags:
+    - cw-agent
+  ansible.builtin.command:
+    argv:
+      - "{{ cloudwatch_agent_root }}/bin/amazon-cloudwatch-agent-ctl"
+      - -a
+      - status
+  delegate_to: "{{ item.ip }}"
+  vars:
+    ansible_connection: "{{ cloudwatch_target_connection }}"
+  become: true
+  register: cloudwatch_agent_final
+  changed_when: false
+  loop: "{{ cloudwatch_targets }}"
+  loop_control:
+    label: "{{ item.id }}"
+
+- name: Assert the agent runs with a loaded configuration on every target
+  tags:
+    - cw-agent
+  ansible.builtin.assert:
+    that:
+      - (item.stdout | from_json).status == 'running'
+      - (item.stdout | from_json).configstatus == 'configured'
+    fail_msg: >-
+      {{ item.item.id }}: agent is not running with a loaded configuration.
+      {{ item.stdout }}
+    quiet: true
+  loop: "{{ cloudwatch_agent_final.results }}"
+  loop_control:
+    label: "{{ item.item.id }}"
+
+# --------------------------------------------------------------------- verify --
+# The only step that proves the system works. Service state is not evidence: an
+# agent can report running while publishing nothing, which is exactly how the
+# EKS observability add-on failed silently for four days.
+#
+# Assumes GNU date on the control node.
+- name: Establish the verification window
+  tags:
+    - cw-agent
+  ansible.builtin.set_fact:
+    cloudwatch_verify_start: >-
+      {{ lookup('pipe', 'date -u -d "' ~ cloudwatch_verify_window_minutes ~ ' minutes ago" +%Y-%m-%dT%H:%M:%SZ') }}
+    cloudwatch_verify_end: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+  when: cloudwatch_verify | bool
+
+- name: Wait for memory datapoints to arrive in CloudWatch
+  tags:
+    - cw-agent
+  ansible.builtin.command:
+    argv:
+      - aws
+      - cloudwatch
+      - get-metric-data
+      - --region
+      - "{{ cloudwatch_region }}"
+      - --start-time
+      - "{{ cloudwatch_verify_start }}"
+      - --end-time
+      - "{{ cloudwatch_verify_end }}"
+      - --metric-data-queries
+      - "{{ [{'Id': 'm1',
+              'MetricStat': {
+                'Metric': {
+                  'Namespace': cloudwatch_agent_namespace,
+                  'MetricName': cloudwatch_verify_metric_name,
+                  'Dimensions': [{'Name': 'InstanceId', 'Value': item.id}]},
+                'Period': cloudwatch_agent_interval | int,
+                'Stat': 'Average'}}] | to_json }}"
+  environment: "{{ cloudwatch_aws_cli_env }}"
+  register: cloudwatch_datapoints
+  changed_when: false
+  until: >-
+    (cloudwatch_datapoints.stdout | from_json).MetricDataResults[0].Values | length > 0
+  retries: "{{ cloudwatch_verify_retries | int }}"
+  delay: "{{ cloudwatch_verify_delay | int }}"
+  loop: "{{ cloudwatch_targets }}"
+  loop_control:
+    label: "{{ item.id }} ({{ item.name | default('unnamed', true) }})"
+  when: cloudwatch_verify | bool
+
+- name: Report the latest value per instance
+  tags:
+    - cw-agent
+  ansible.builtin.debug:
+    msg: >-
+      {{ item.item.id }}: {{ cloudwatch_verify_metric_name }} =
+      {{ ((item.stdout | from_json).MetricDataResults[0].Values | first) | round(2) }}%
+      ({{ (item.stdout | from_json).MetricDataResults[0].Values | length }} datapoint(s)
+      in the last {{ cloudwatch_verify_window_minutes }} min)
+  loop: "{{ cloudwatch_datapoints.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.id | default('skipped') }}"
+  when: item.stdout is defined

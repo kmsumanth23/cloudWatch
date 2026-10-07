@@ -1,0 +1,132 @@
+---
+# CloudWatch agent memory monitoring — defaults.
+# Per the repo convention, override these in the client environment vars file,
+# not here.
+
+# --- target selection -------------------------------------------------------
+cloudwatch_region: us-east-1
+
+# Targets are discovered by tag. Apply this tag to every instance that should
+# collect memory metrics; a newly launched instance carrying it is picked up on
+# the next run.
+cloudwatch_target_tag_key: cloudwatch_memory_monitoring
+cloudwatch_target_tag_value: "true"
+
+# Explicit override. When non-empty, these instance IDs are used instead of
+# tag discovery. Useful for a first run before tags are applied.
+cloudwatch_target_instances: []
+
+# --- IAM --------------------------------------------------------------------
+# The role and instance profile are created by the IAM team as a prerequisite.
+# This automation only associates an existing profile.
+cloudwatch_instance_profile_name: ""
+
+cloudwatch_associate_profile: true
+
+# An instance can hold only one instance profile. If a target already has a
+# different one, associating would silently strip whatever permissions the
+# workload was using, so the run fails instead. Flip this only with an
+# explicit decision per instance.
+cloudwatch_replace_existing_profile: false
+
+# --- agent package ----------------------------------------------------------
+# Keyed by ansible_facts['os_family'], following the registry_mappings pattern
+# in aws-client-vars-base.yml.
+# NOTE: only the RedHat entry is verified (AlmaLinux 8.10). The Debian URL is
+# from AWS documentation and has not been exercised here.
+cloudwatch_agent_package_urls:
+  RedHat: "https://amazoncloudwatch-agent-{{ cloudwatch_region }}.s3.{{ cloudwatch_region }}.amazonaws.com/redhat/amd64/latest/amazon-cloudwatch-agent.rpm"
+  Debian: "https://amazoncloudwatch-agent-{{ cloudwatch_region }}.s3.{{ cloudwatch_region }}.amazonaws.com/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb"
+
+# Mirrors the manual `rpm -U` behaviour used during the pilot. Set to false
+# once AWS's package signing key is present on the hosts.
+cloudwatch_agent_disable_gpg_check: true
+
+cloudwatch_agent_root: /opt/aws/amazon-cloudwatch-agent
+cloudwatch_agent_config_filename: cwagent-memory.json
+cloudwatch_agent_service: amazon-cloudwatch-agent
+
+# --- agent configuration content -------------------------------------------
+cloudwatch_agent_namespace: CWAgent
+cloudwatch_agent_interval: 60
+cloudwatch_agent_run_as_user: cwagent
+cloudwatch_agent_debug: false
+
+# InstanceId as the sole dimension: minimum metric count, and the only shape
+# AWS Compute Optimizer can consume. ${aws:InstanceId} is an agent placeholder
+# resolved from IMDS at startup — it is not templated here on purpose.
+cloudwatch_agent_append_dimensions:
+  InstanceId: "${aws:InstanceId}"
+
+cloudwatch_agent_aggregation_dimensions:
+  - - InstanceId
+
+cloudwatch_agent_metrics_collected:
+  mem:
+    measurement:
+      - name: mem_used_percent
+        unit: Percent
+
+# --- verification -----------------------------------------------------------
+# Service state is not evidence. The run fails unless datapoints actually
+# reach CloudWatch.
+cloudwatch_verify: true
+cloudwatch_verify_metric_name: mem_used_percent
+cloudwatch_verify_window_minutes: 15
+cloudwatch_verify_retries: 10
+cloudwatch_verify_delay: 30
+
+# --- AWS CLI credential seam ------------------------------------------------
+# Populate from the existing sts_assume_role pattern used elsewhere in this
+# repo, e.g.
+#   cloudwatch_aws_cli_env:
+#     AWS_ACCESS_KEY_ID:     "{{ assumed_role.sts_creds.access_key }}"
+#     AWS_SECRET_ACCESS_KEY: "{{ assumed_role.sts_creds.secret_key }}"
+#     AWS_SESSION_TOKEN:     "{{ assumed_role.sts_creds.session_token }}"
+# Left empty so the CLI falls back to whatever the EE already has.
+cloudwatch_aws_cli_env: {}
+
+# --- single-play execution controls -----------------------------------------
+# Target hosts are reached with delegate_to rather than being a play host
+# group, because add_host cannot affect the current play. Host work is
+# therefore serial.
+
+# Seconds to wait after associating an instance profile before the agent can
+# obtain credentials from IMDS.
+cloudwatch_profile_propagation_delay: 60
+
+# true  — the first host that fails to install aborts the run
+# false — installation failures are collected and surfaced by the
+#         post-install assertion instead, so one bad host does not block the
+#         rest. Closer to how a multi-host play behaves.
+cloudwatch_fail_fast: true
+
+# Force the OS family instead of reading it from delegated facts. Leave empty
+# to auto-detect. Set to RedHat or Debian if fact delegation is unavailable.
+cloudwatch_agent_os_family_override: ""
+
+# Connection used for tasks delegated to target hosts.
+#
+# REQUIRED. The play sets connection: local so control-node tasks work
+# regardless of how the playbook is invoked, and Ansible leaks that into
+# delegate_to — without this override every "install on the target" task
+# silently executes on the control node instead. Verified behaviour, not a
+# precaution.
+cloudwatch_target_connection: ssh
+
+# --- discovery mode ---------------------------------------------------------
+# vsi_vars  — read vsi_instances from the client environment vars file and act
+#             on entries flagged with cloudwatch_vsi_flag. Scope is one
+#             environment, which is what the client vars file describes.
+# tag       — act on instances carrying an AWS tag. Crosses environments.
+# explicit  — act on cloudwatch_target_instances.
+cloudwatch_discovery_mode: vsi_vars
+
+# Key added to a vsi_instances entry to opt that VSI in.
+cloudwatch_vsi_flag: cloudwatch_agent
+
+# Derived from the selected vsi_instances entries unless set here directly.
+# Set it explicitly if the Name convention differs from
+#   <prefix><client_code><stack><type><env_seq><instance_seq:03d>
+# cloudwatch_vsi_name_patterns:
+#   - "*hxsautlbst3001"
