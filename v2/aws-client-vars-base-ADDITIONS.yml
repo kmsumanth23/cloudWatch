@@ -1,0 +1,66 @@
+# ----------------------------------------------------------------------------
+# APPEND TO: aws-v9-automation/aws-client-vars-base.yml
+#
+# Org-wide defaults for the CloudWatch agent, in the same place certificates /
+# client_cert_expiry_notice / smtp_* live. Per the file's own header, override
+# in the client environment vars file, not here.
+# ----------------------------------------------------------------------------
+
+# Flag read from the client environment vars file. Setting it true there is
+# how a client environment opts in.
+cw_agent_flag_name: cloudwatch_agent_enabled
+
+# Role and instance profile names are DERIVED from client_code at runtime and
+# verified through the AWS CLI:
+#   HCLSW_AWS_<CLIENT>_EC2_CLOUDWATCH_FULLACCESS_SVC_ROLE
+# Both are left undefined here on purpose. Set them in a client environment
+# vars file only if that client deviates from the convention.
+# cw_role_name: ""
+# cw_profile_name: ""
+
+# Seconds to wait after associating an instance profile before IMDS serves the
+# new role credentials.
+cw_profile_propagation_delay: 60
+
+# Agent package, keyed by ansible_facts['os_family'], following the
+# registry_mappings pattern already in this file.
+# Only the RedHat entry is verified (AlmaLinux 8.10).
+cw_agent_package_urls:
+  RedHat: "https://amazoncloudwatch-agent-{{ cw_region | default(aws_region) }}.s3.{{ cw_region | default(aws_region) }}.amazonaws.com/redhat/amd64/latest/amazon-cloudwatch-agent.rpm"
+  Debian: "https://amazoncloudwatch-agent-{{ cw_region | default(aws_region) }}.s3.{{ cw_region | default(aws_region) }}.amazonaws.com/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb"
+
+cw_agent_disable_gpg_check: true
+cw_agent_root: /opt/aws/amazon-cloudwatch-agent
+cw_agent_config_filename: cwagent-memory.json
+cw_agent_service: amazon-cloudwatch-agent
+
+# Agent configuration content.
+#
+# One metric per instance, InstanceId as the sole dimension: the minimum
+# metric count, and the only shape AWS Compute Optimizer can consume.
+# ${aws:InstanceId} is an agent placeholder resolved from IMDS at startup —
+# it must reach the rendered file literally.
+cw_agent_namespace: CWAgent
+cw_agent_interval: 60
+cw_agent_run_as_user: cwagent
+cw_agent_debug: false
+
+cw_agent_append_dimensions:
+  InstanceId: "${aws:InstanceId}"
+
+cw_agent_aggregation_dimensions:
+  - - InstanceId
+
+cw_agent_metrics_collected:
+  mem:
+    measurement:
+      - name: mem_used_percent
+        unit: Percent
+
+# Verification. Service state is not evidence — the run fails unless
+# datapoints actually reach CloudWatch.
+cw_verify: true
+cw_verify_metric_name: mem_used_percent
+cw_verify_window_minutes: 15
+cw_verify_retries: 10
+cw_verify_delay: 30

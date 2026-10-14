@@ -1,0 +1,34 @@
+---
+# aws-v9-automation/awscloudwatchagentauto.yml
+#
+# Installs and configures the Amazon CloudWatch agent for memory utilization
+# metrics on a client environment's VSIs.
+#
+# Structure mirrors awsacmcertimportauto.yml: hosts: all against the AWX
+# inventory for one client environment, base vars from the repo root, client
+# and environment vars resolved by tasks/client-vars-include.yml.
+#
+# PREREQUISITE, owned by the IAM team and NOT performed here: an IAM role
+# trusting ec2.amazonaws.com with CloudWatchAgentServerPolicy attached, and an
+# instance profile of the same name. The task file verifies both exist through
+# the AWS CLI and stops if either is missing.
+#
+# GATE: runs only when the client environment has opted in. See
+# cw_agent_flag_name in tasks/aws-cloudwatch-agent.yml.
+
+- name: AWS Client VSI CloudWatch Agent Setup
+  hosts: all
+  become: yes
+  gather_facts: yes
+  vars_files:
+    - aws-client-vars-base.yml
+
+  pre_tasks:
+    - name: Include the default and override variables
+      include_tasks: tasks/client-vars-include.yml
+      tags: common
+
+  tasks:
+    - name: include tasks to install and configure the cloudwatch agent
+      include_tasks: tasks/aws-cloudwatch-agent.yml
+      tags: cw-agent

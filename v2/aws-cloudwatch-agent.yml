@@ -1,0 +1,460 @@
+---
+# aws-v9-automation/tasks/aws-cloudwatch-agent.yml
+#
+# Installs the Amazon CloudWatch agent and configures it to publish memory
+# utilization, for every host in this client environment's inventory.
+#
+# Runs against the play's hosts (hosts: all). AWS CLI calls run ON the host
+# with the assumed-role credentials supplied through environment:, the same
+# pattern tasks/aws-cert-import.yml uses for `aws acm import-certificate`.
+# Nothing is delegated and nothing is discovered — the inventory is the
+# target list.
+
+# ==================================================================
+# NAMING
+#
+# Role and instance profile names are DERIVED from client_code, never
+# hardcoded, and are then verified to exist through the AWS CLI. Only the
+# client portion varies between clients.
+#
+#   hxsa -> HCLSW_AWS_HXSA_EC2_CLOUDWATCH_FULLACCESS_SVC_ROLE
+#
+# Override cw_role_name / cw_profile_name if a client ever deviates.
+# ==================================================================
+- name: Resolve CloudWatch agent naming and settings
+  set_fact:
+    cw_agent_flag_name: "{{ cw_agent_flag_name | default('cloudwatch_agent_enabled') }}"
+    cw_role_name: >-
+      {{ cw_role_name
+         | default('HCLSW_AWS_' ~ (client_code | upper) ~ '_EC2_CLOUDWATCH_FULLACCESS_SVC_ROLE', true) }}
+    cw_profile_name: >-
+      {{ cw_profile_name
+         | default(cw_role_name
+                   | default('HCLSW_AWS_' ~ (client_code | upper) ~ '_EC2_CLOUDWATCH_FULLACCESS_SVC_ROLE', true), true) }}
+    cw_region: "{{ cw_region | default(aws_region, true) }}"
+    cw_aws_cli: "{{ cw_aws_cli | default('/usr/local/bin/aws', true) }}"
+  tags: cw-agent
+
+# ==================================================================
+# GATE
+#
+# The client environment vars file is read for ONE flag. Its only purpose
+# here is to say whether this environment has opted in.
+#
+# Read with the custom-delimiter template trick used by
+# awx-workflow-certs-aws.yml: aws-client-vars-env.yml contains regular
+# {{ }} references (security_groups, aws_subnets_custom, ...) that would
+# raise undefined-variable errors if rendered in this play's context.
+# ==================================================================
+- name: Resolve the client environment vars file path
+  set_fact:
+    cw_client_env_file: "{{ client_vars_directory }}/{{ client_code }}/{{ client_env }}/aws-client-vars-env.yml"
+  tags: cw-agent
+
+- name: Read the CloudWatch agent flag from the client environment vars file
+  set_fact:
+    cw_enabled: "{{ cw_env_file_vars[cw_agent_flag_name] | default(false) }}"
+  vars:
+    cw_env_file_vars: >-
+      {{ lookup('template', cw_client_env_file, errors='ignore',
+                variable_start_string='[%', variable_end_string='%]')
+         | from_yaml | default({}, true) }}
+  tags: cw-agent
+
+- name: Report the CloudWatch agent decision for this client environment
+  debug:
+    msg: >-
+      {{ client_code }}/{{ client_env }}:
+      {{ cw_agent_flag_name }}={{ cw_enabled }}
+      ({{ cw_client_env_file }})
+      {{ '- proceeding' if (cw_enabled | bool) else '- not enabled, skipping' }}
+  run_once: true
+  tags: cw-agent
+
+- name: Install and configure the CloudWatch agent
+  when: cw_enabled | bool
+  tags: cw-agent
+  block:
+
+    # ============================================================
+    # AUTHENTICATION
+    # ============================================================
+    - name: Get authentication session details
+      sts_assume_role:
+        role_arn: "{{ arn_auto_admin_val }}"
+        role_session_name: operstssess0
+        aws_access_key: "{{ access_val }}"
+        aws_secret_key: "{{ sec_val }}"
+        duration_seconds: 3600
+        aws_region: "{{ aws_region }}"
+      register: assumed_role
+      delegate_to: localhost
+      run_once: true
+
+    - name: Print assumed_role details
+      debug:
+        msg: "{{ assumed_role.sts_creds }}"
+      tags:
+        - debug
+        - never
+
+    - name: Set AWS STS credentials
+      set_fact:
+        aws_access_key: "{{ assumed_role.sts_creds.access_key }}"
+        aws_secret_key: "{{ assumed_role.sts_creds.secret_key }}"
+        aws_session_token: "{{ assumed_role.sts_creds.session_token }}"
+
+    # ============================================================
+    # PREREQUISITE VERIFICATION
+    #
+    # The role and instance profile are created by the IAM team. Verified
+    # here rather than assumed: a missing instance profile is the failure
+    # that looks like everything worked. Checked once per run, not per host.
+    # ============================================================
+    - name: Check the CloudWatch IAM role exists
+      shell: >
+        {{ cw_aws_cli }} iam get-role --role-name {{ cw_role_name }}
+      become: true
+      become_user: root
+      become_method: su
+      become_exe: sudo su -
+      environment:
+        AWS_ACCESS_KEY_ID: "{{ aws_access_key }}"
+        AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
+        AWS_SESSION_TOKEN: "{{ aws_session_token }}"
+      register: cw_role_check
+      changed_when: false
+      failed_when: false
+      run_once: true
+
+    - name: Fail when the CloudWatch IAM role does not exist
+      fail:
+        msg: >-
+          IAM role {{ cw_role_name }} was not found in this account.
+          It is a prerequisite created by the IAM team, trusting
+          ec2.amazonaws.com with CloudWatchAgentServerPolicy attached.
+          AWS reported: {{ cw_role_check.stderr | default('') | trim }}
+      when: cw_role_check.rc != 0
+      run_once: true
+
+    - name: Check the CloudWatch instance profile exists
+      shell: >
+        {{ cw_aws_cli }} iam get-instance-profile
+        --instance-profile-name {{ cw_profile_name }}
+      become: true
+      become_user: root
+      become_method: su
+      become_exe: sudo su -
+      environment:
+        AWS_ACCESS_KEY_ID: "{{ aws_access_key }}"
+        AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
+        AWS_SESSION_TOKEN: "{{ aws_session_token }}"
+      register: cw_profile_check
+      changed_when: false
+      failed_when: false
+      run_once: true
+
+    - name: Fail when the CloudWatch instance profile does not exist
+      fail:
+        msg: >-
+          Instance profile {{ cw_profile_name }} was not found. A role with
+          EC2 trust cannot be attached to an instance without one; the IAM
+          team must create it and add {{ cw_role_name }} to it.
+          AWS reported: {{ cw_profile_check.stderr | default('') | trim }}
+      when: cw_profile_check.rc != 0
+      run_once: true
+
+    - name: Confirm the role is a member of the instance profile
+      set_fact:
+        cw_profile_roles: >-
+          {{ (cw_profile_check.stdout | from_json).InstanceProfile.Roles
+             | map(attribute='RoleName') | list }}
+      run_once: true
+
+    - name: Fail when the instance profile does not contain the role
+      fail:
+        msg: >-
+          Instance profile {{ cw_profile_name }} exists but contains
+          {{ cw_profile_roles | join(', ') | default('no roles', true) }},
+          not {{ cw_role_name }}. The IAM team must add the role to the
+          profile.
+      when: cw_role_name not in cw_profile_roles
+      run_once: true
+
+    # ============================================================
+    # INSTANCE IDENTITY
+    #
+    # Each host reports its own instance id from IMDS. IMDSv2 token first,
+    # falling back to v1 for instances that still allow it.
+    # ============================================================
+    - name: Get an IMDSv2 token
+      shell: >
+        curl -s -m 5 -X PUT "http://169.254.169.254/latest/api/token"
+        -H "X-aws-ec2-metadata-token-ttl-seconds: 300"
+      register: cw_imds_token
+      changed_when: false
+      failed_when: false
+
+    - name: Get this host's EC2 instance id
+      shell: >
+        curl -s -m 5
+        {% if cw_imds_token.stdout | default('') | length > 0 %}
+        -H "X-aws-ec2-metadata-token: {{ cw_imds_token.stdout }}"
+        {% endif %}
+        http://169.254.169.254/latest/meta-data/instance-id
+      register: cw_instance_id_raw
+      changed_when: false
+      failed_when: false
+
+    - name: Record this host's instance id
+      set_fact:
+        cw_instance_id: "{{ cw_instance_id_raw.stdout | default('') | trim }}"
+
+    - name: Fail when the instance id could not be read
+      fail:
+        msg: >-
+          Could not read the EC2 instance id from IMDS on
+          {{ inventory_hostname }}. IMDS may be disabled or hop-limited.
+      when: cw_instance_id | length == 0
+
+    # ============================================================
+    # INSTANCE PROFILE ASSOCIATION
+    #
+    # An instance holds exactly ONE instance profile. Where one is already
+    # attached and it is not ours, the run fails rather than replacing it —
+    # replacing silently removes whatever permissions the workload uses.
+    # ============================================================
+    - name: Read the instance profile currently attached to this host
+      shell: >
+        {{ cw_aws_cli }} ec2 describe-instances
+        --region {{ cw_region }}
+        --instance-ids {{ cw_instance_id }}
+        --query 'Reservations[].Instances[].IamInstanceProfile.Arn'
+        --output text
+      become: true
+      become_user: root
+      become_method: su
+      become_exe: sudo su -
+      environment:
+        AWS_ACCESS_KEY_ID: "{{ aws_access_key }}"
+        AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
+        AWS_SESSION_TOKEN: "{{ aws_session_token }}"
+      register: cw_current_profile
+      changed_when: false
+
+    - name: Classify the current instance profile
+      set_fact:
+        cw_profile_arn: "{{ cw_current_profile.stdout | default('') | trim }}"
+        cw_profile_absent: >-
+          {{ (cw_current_profile.stdout | default('') | trim) in ['', 'None'] }}
+        cw_profile_is_ours: >-
+          {{ cw_profile_name in (cw_current_profile.stdout | default('') | trim) }}
+
+    - name: Fail when a different instance profile is already attached
+      fail:
+        msg: >-
+          {{ inventory_hostname }} ({{ cw_instance_id }}) already has instance
+          profile {{ cw_profile_arn }}. An instance can hold only one, so
+          attaching {{ cw_profile_name }} would remove the permissions its
+          workload is currently using. Resolve this deliberately before
+          re-running.
+      when:
+        - not (cw_profile_absent | bool)
+        - not (cw_profile_is_ours | bool)
+
+    - name: Associate the CloudWatch instance profile
+      shell: >
+        {{ cw_aws_cli }} ec2 associate-iam-instance-profile
+        --region {{ cw_region }}
+        --instance-id {{ cw_instance_id }}
+        --iam-instance-profile Name={{ cw_profile_name }}
+      become: true
+      become_user: root
+      become_method: su
+      become_exe: sudo su -
+      environment:
+        AWS_ACCESS_KEY_ID: "{{ aws_access_key }}"
+        AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
+        AWS_SESSION_TOKEN: "{{ aws_session_token }}"
+      register: cw_associate
+      when: cw_profile_absent | bool
+
+    - name: Report the association id for rollback
+      debug:
+        msg: >-
+          {{ inventory_hostname }} ({{ cw_instance_id }}) ->
+          {{ (cw_associate.stdout | from_json).IamInstanceProfileAssociation.AssociationId }}
+      when: cw_associate is not skipped
+
+    - name: Wait for IMDS to serve the new role credentials
+      pause:
+        seconds: "{{ cw_profile_propagation_delay | default(60) }}"
+      run_once: true
+      when: cw_profile_absent | bool
+
+    # ============================================================
+    # AGENT INSTALL
+    # ============================================================
+    - name: Fail when no agent package is defined for this OS family
+      fail:
+        msg: >-
+          {{ inventory_hostname }} reports OS family
+          '{{ ansible_facts['os_family'] }}', which has no entry in
+          cw_agent_package_urls.
+      when: ansible_facts['os_family'] not in cw_agent_package_urls
+
+    - name: Install the CloudWatch agent (RHEL family)
+      dnf:
+        name: "{{ cw_agent_package_urls['RedHat'] }}"
+        state: present
+        disable_gpg_check: "{{ cw_agent_disable_gpg_check | bool }}"
+      become: true
+      become_user: root
+      become_method: su
+      become_exe: sudo su -
+      when: ansible_facts['os_family'] == 'RedHat'
+
+    - name: Install the CloudWatch agent (Debian family)
+      apt:
+        deb: "{{ cw_agent_package_urls['Debian'] }}"
+      become: true
+      become_user: root
+      become_method: su
+      become_exe: sudo su -
+      when: ansible_facts['os_family'] == 'Debian'
+
+    - name: Confirm the agent control binary is present
+      stat:
+        path: "{{ cw_agent_root }}/bin/amazon-cloudwatch-agent-ctl"
+      become: true
+      register: cw_ctl
+
+    - name: Fail when the agent did not install
+      fail:
+        msg: >-
+          Package install reported success but
+          {{ cw_agent_root }}/bin/amazon-cloudwatch-agent-ctl is missing on
+          {{ inventory_hostname }}.
+      when: not cw_ctl.stat.exists
+
+    # ============================================================
+    # CONFIGURATION
+    #
+    # The rendered file is identical on every host. ${aws:InstanceId} is an
+    # agent placeholder resolved from IMDS at startup — it is deliberately
+    # NOT templated to a literal instance id, which would make the file
+    # host-specific.
+    # ============================================================
+    - name: Deploy the agent configuration
+      template:
+        src: amazon-cloudwatch-agent.json.j2
+        dest: "{{ cw_agent_root }}/etc/{{ cw_agent_config_filename }}"
+        owner: root
+        group: root
+        mode: "0644"
+        validate: "python3 -c \"import json,sys; json.load(open('%s'))\""
+      become: true
+      become_user: root
+      become_method: su
+      become_exe: sudo su -
+      register: cw_config
+
+    - name: Query current agent status
+      shell: >
+        {{ cw_agent_root }}/bin/amazon-cloudwatch-agent-ctl -a status
+      become: true
+      become_user: root
+      become_method: su
+      become_exe: sudo su -
+      register: cw_agent_status
+      changed_when: false
+      failed_when: false
+
+    - name: Apply the configuration and start the agent
+      shell: >
+        {{ cw_agent_root }}/bin/amazon-cloudwatch-agent-ctl
+        -a fetch-config -m ec2 -s
+        -c file:{{ cw_agent_root }}/etc/{{ cw_agent_config_filename }}
+      become: true
+      become_user: root
+      become_method: su
+      become_exe: sudo su -
+      when: >-
+        cw_config.changed
+        or ('"status": "running"' not in (cw_agent_status.stdout | default('')))
+
+    - name: Ensure the agent service is enabled and running
+      systemd:
+        name: "{{ cw_agent_service }}"
+        enabled: true
+        state: started
+      become: true
+      become_user: root
+      become_method: su
+      become_exe: sudo su -
+
+    - name: Re-read agent status after configuration
+      shell: >
+        {{ cw_agent_root }}/bin/amazon-cloudwatch-agent-ctl -a status
+      become: true
+      become_user: root
+      become_method: su
+      become_exe: sudo su -
+      register: cw_agent_final
+      changed_when: false
+
+    - name: Fail when the agent is not running with a loaded configuration
+      fail:
+        msg: >-
+          {{ inventory_hostname }}: agent is not running with a loaded
+          configuration. {{ cw_agent_final.stdout }}
+      when: >-
+        (cw_agent_final.stdout | from_json).status != 'running'
+        or (cw_agent_final.stdout | from_json).configstatus != 'configured'
+
+    # ============================================================
+    # VERIFICATION
+    #
+    # The only step that proves the system works: an agent can report
+    # running while publishing nothing.
+    #
+    # Uses the assumed-role credentials, NOT the instance profile.
+    # CloudWatchAgentServerPolicy grants PutMetricData but not
+    # GetMetricData, so the instance cannot read its own metrics back.
+    # ============================================================
+    - name: Wait for memory datapoints to arrive in CloudWatch
+      shell: >
+        {{ cw_aws_cli }} cloudwatch get-metric-statistics
+        --region {{ cw_region }}
+        --namespace {{ cw_agent_namespace }}
+        --metric-name {{ cw_verify_metric_name }}
+        --dimensions Name=InstanceId,Value={{ cw_instance_id }}
+        --start-time $(date -u -d '{{ cw_verify_window_minutes }} minutes ago' +%Y-%m-%dT%H:%M:%SZ)
+        --end-time $(date -u +%Y-%m-%dT%H:%M:%SZ)
+        --period {{ cw_agent_interval }}
+        --statistics Average
+        --query 'length(Datapoints)'
+        --output text
+      become: true
+      become_user: root
+      become_method: su
+      become_exe: sudo su -
+      environment:
+        AWS_ACCESS_KEY_ID: "{{ aws_access_key }}"
+        AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
+        AWS_SESSION_TOKEN: "{{ aws_session_token }}"
+      register: cw_datapoints
+      changed_when: false
+      until: (cw_datapoints.stdout | default('0') | trim | int) > 0
+      retries: "{{ cw_verify_retries | int }}"
+      delay: "{{ cw_verify_delay | int }}"
+      when: cw_verify | bool
+
+    - name: Report the result for this host
+      debug:
+        msg: >-
+          {{ inventory_hostname }} ({{ cw_instance_id }}):
+          {{ cw_datapoints.stdout | default('0') | trim }} datapoint(s) of
+          {{ cw_verify_metric_name }} in the last
+          {{ cw_verify_window_minutes }} minutes
+      when: cw_verify | bool
