@@ -2,46 +2,87 @@
 # APPEND TO: aws-v9-automation/aws-client-vars-base.yml
 #
 # Org-wide defaults for the CloudWatch agent, in the same place certificates /
-# client_cert_expiry_notice / smtp_* live. Per the file's own header, override
-# in the client environment vars file, not here.
+# client_cert_expiry_notice / smtp_* live.
+#
+# Loaded by the playbook's `vars_files:` (precedence 14), NOT by include_vars
+# (18). That ordering is deliberate: client environment vars and job extra
+# vars must both be able to override these. A previous version loaded them
+# with include_vars from defaults/cloudwatch.yml, which silently beat every
+# client override.
+#
+# Per the file's own header, override in the client environment vars file.
 # ----------------------------------------------------------------------------
 
 # Flag read from the client environment vars file. Setting it true there is
 # how a client environment opts in.
-cw_agent_flag_name: cloudwatch_agent_enabled
+cw_agent_flag_name: cloudwatch_agent
 
 # Role and instance profile names are DERIVED from client_code at runtime and
 # verified through the AWS CLI:
-#   HCLSW_AWS_<CLIENT>_EC2_CLOUDWATCH_FULLACCESS_SVC_ROLE
+#   role:    HCLSW_AWS_<CLIENT>_EC2_CLOUDWATCH_FULLACCESS_SVC_ROLE
+#   profile: HCLSW_AWS_<CLIENT>_EC2_CLOUDWATCH_FULLACCESS_SVC_PROFILE
 # Both are left undefined here on purpose. Set them in a client environment
 # vars file only if that client deviates from the convention.
+#
+# hxsa predates the convention: its live profile is named ..._SVC_ROLE. Pin it
+# in clients/hxsa/<env>/aws-client-vars-env.yml until it is migrated:
+#   cw_profile_name: HCLSW_AWS_HXSA_EC2_CLOUDWATCH_FULLACCESS_SVC_ROLE
 # cw_role_name: ""
 # cw_profile_name: ""
+
+# An instance holds exactly ONE instance profile. By default the run stops
+# when a target already carries a different one, because attaching ours would
+# remove whatever permissions its workload uses.
+#
+# Set true at launch to replace it deliberately. The replaced ARN is printed
+# before the change so it can be restored.
+cw_force_profile_replace: false
 
 # Seconds to wait after associating an instance profile before IMDS serves the
 # new role credentials.
 cw_profile_propagation_delay: 60
 
-# Agent package, keyed by ansible_facts['os_family'], following the
-# registry_mappings pattern already in this file.
+# --- agent package ----------------------------------------------------------
+# Agent version. 'latest' tracks whatever AWS currently publishes; pin to an
+# exact version string to standardise across accounts.
+#
+# The version installed during the pilot, from `amazon-cloudwatch-agent-ctl
+# -a status`, was 1.300073.1b1859. CONFIRM a pinned path resolves before
+# relying on it — only the 'latest' path has been exercised here.
+cw_agent_version: latest
+
+# Keyed by ansible_facts['os_family'], following the registry_mappings pattern
+# already in this file. AlmaLinux 8/9 and RHEL 8/9 all report RedHat.
 # Only the RedHat entry is verified (AlmaLinux 8.10).
 cw_agent_package_urls:
-  RedHat: "https://amazoncloudwatch-agent-{{ cw_region | default(aws_region) }}.s3.{{ cw_region | default(aws_region) }}.amazonaws.com/redhat/amd64/latest/amazon-cloudwatch-agent.rpm"
-  Debian: "https://amazoncloudwatch-agent-{{ cw_region | default(aws_region) }}.s3.{{ cw_region | default(aws_region) }}.amazonaws.com/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb"
+  RedHat: "https://amazoncloudwatch-agent-{{ cw_region | default(aws_region) }}.s3.{{ cw_region | default(aws_region) }}.amazonaws.com/redhat/amd64/{{ cw_agent_version }}/amazon-cloudwatch-agent.rpm"
+  Debian: "https://amazoncloudwatch-agent-{{ cw_region | default(aws_region) }}.s3.{{ cw_region | default(aws_region) }}.amazonaws.com/ubuntu/amd64/{{ cw_agent_version }}/amazon-cloudwatch-agent.deb"
 
 cw_agent_disable_gpg_check: true
 cw_agent_root: /opt/aws/amazon-cloudwatch-agent
 cw_agent_config_filename: cwagent-memory.json
 cw_agent_service: amazon-cloudwatch-agent
 
-# Agent configuration content.
+# --- agent configuration content --------------------------------------------
 #
 # One metric per instance, InstanceId as the sole dimension: the minimum
 # metric count, and the only shape AWS Compute Optimizer can consume.
 # ${aws:InstanceId} is an agent placeholder resolved from IMDS at startup —
 # it must reach the rendered file literally.
 cw_agent_namespace: CWAgent
+
+# Collection interval in seconds. Overridable three ways, in increasing
+# precedence:
+#   this file                      org-wide default
+#   aws-client-vars-env.yml        per client environment
+#   -e cw_agent_interval=300       per job launch (JT extra vars or survey)
+#
+# Drives both the agent config and the --period of the verification query.
+#
+# Below 60 requires high-resolution metrics, which this configuration does not
+# enable and which costs considerably more. Use 60, or a multiple of it.
 cw_agent_interval: 60
+
 cw_agent_run_as_user: cwagent
 cw_agent_debug: false
 
@@ -57,8 +98,9 @@ cw_agent_metrics_collected:
       - name: mem_used_percent
         unit: Percent
 
-# Verification. Service state is not evidence — the run fails unless
-# datapoints actually reach CloudWatch.
+# --- verification -----------------------------------------------------------
+# Service state is not evidence — the run fails unless datapoints actually
+# reach CloudWatch.
 cw_verify: true
 cw_verify_metric_name: mem_used_percent
 cw_verify_window_minutes: 15
