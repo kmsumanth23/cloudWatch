@@ -17,10 +17,14 @@
 # hardcoded, and are then verified to exist through the AWS CLI. Only the
 # client portion varies between clients.
 #
-#   hxsa -> HCLSW_AWS_HXSA_EC2_CLOUDWATCH_FULLACCESS_SVC_ROLE
+#   hxsa -> HCLSW_AWS_HXSA_EC2_CLOUDWATCH_FULLACCESS_SVC_ROLE     (role)
+#           HCLSW_AWS_HXSA_EC2_CLOUDWATCH_FULLACCESS_SVC_PROFILE  (instance profile)
 #
-# Override cw_role_name / cw_profile_name if a client ever deviates.
+# Override cw_role_name / cw_profile_name if a client ever deviates. hxsa's
+# live profile predates this convention and is named ..._SVC_ROLE; pin it with
+# cw_profile_name in that client environment's vars file until it is migrated.
 # ==================================================================
+
 - name: Resolve CloudWatch agent naming and settings
   set_fact:
     cw_agent_flag_name: "{{ cw_agent_flag_name | default('cloudwatch_agent_enabled') }}"
@@ -29,8 +33,7 @@
          | default('HCLSW_AWS_' ~ (client_code | upper) ~ '_EC2_CLOUDWATCH_FULLACCESS_SVC_ROLE', true) }}
     cw_profile_name: >-
       {{ cw_profile_name
-         | default(cw_role_name
-                   | default('HCLSW_AWS_' ~ (client_code | upper) ~ '_EC2_CLOUDWATCH_FULLACCESS_SVC_ROLE', true), true) }}
+         | default('HCLSW_AWS_' ~ (client_code | upper) ~ '_EC2_CLOUDWATCH_FULLACCESS_SVC_PROFILE', true) }}
     cw_region: "{{ cw_region | default(aws_region, true) }}"
     cw_aws_cli: "{{ cw_aws_cli | default('/usr/local/bin/aws', true) }}"
   tags: cw-agent
@@ -51,15 +54,44 @@
     cw_client_env_file: "{{ client_vars_directory }}/{{ client_code }}/{{ client_env }}/aws-client-vars-env.yml"
   tags: cw-agent
 
-- name: Read the CloudWatch agent flag from the client environment vars file
+# - name: Read the CloudWatch agent flag from the client environment vars file
+#   set_fact:
+#     cw_enabled: "{{ cw_env_file_vars[cw_agent_flag_name] | default(false) }}"
+#   vars:
+#     cw_env_file_vars: >-
+#       {{ lookup('template', cw_client_env_file, errors='ignore',
+#                 variable_start_string='[%', variable_end_string='%]')
+#          | from_yaml | default({}, true) }}
+#   tags: cw-agent
+
+# no_log: the fact holds the WHOLE client environment vars file. Only one
+# boolean is wanted from it, and it is discarded immediately after parsing.
+# errors='ignore': a client environment with no such file skips cleanly
+# instead of failing the run.
+- name: Read raw file content from controller
   set_fact:
-    cw_enabled: "{{ cw_env_file_vars[cw_agent_flag_name] | default(false) }}"
-  vars:
-    cw_env_file_vars: >-
-      {{ lookup('template', cw_client_env_file, errors='ignore',
-                variable_start_string='[%', variable_end_string='%]')
-         | from_yaml | default({}, true) }}
+    cw_raw_content: "{{ lookup('file', cw_client_env_file, errors='ignore') | default('', true) }}"
+  delegate_to: localhost
+  no_log: true
   tags: cw-agent
+
+- name: Parse and evaluate CloudWatch agent flag
+  set_fact:
+    cw_enabled: >-
+      {{ (cw_raw_content | from_yaml | default({}, true)).get(cw_agent_flag_name, false) | bool }}
+  tags: cw-agent
+
+- name: Discard the client environment file content
+  set_fact:
+    cw_raw_content: ""
+  tags: cw-agent
+
+# - name: DEBUG - Check what the lookup is returning
+#   debug:
+#     msg: 
+#       - "Target file path: {{ cw_client_env_file }}"
+#       - "Raw content read: {{ lookup('file', cw_client_env_file, errors='warn') }}"
+#   tags: cw-agent
 
 - name: Report the CloudWatch agent decision for this client environment
   debug:
@@ -76,6 +108,15 @@
   tags: cw-agent
   block:
 
+    - name: Fail on a collection interval that needs high-resolution metrics
+      fail:
+        msg: >-
+          cw_agent_interval is {{ cw_agent_interval }}. Values below 60
+          require high-resolution metrics, which this configuration does not
+          enable and which costs considerably more. Use 60 or a multiple.
+      when: (cw_agent_interval | int) < 60
+      run_once: true
+
     # ============================================================
     # AUTHENTICATION
     # ============================================================
@@ -90,19 +131,16 @@
       register: assumed_role
       delegate_to: localhost
       run_once: true
+      no_log: true
 
-    - name: Print assumed_role details
-      debug:
-        msg: "{{ assumed_role.sts_creds }}"
-      tags:
-        - debug
-        - never
-
+    # set_fact defaults to cacheable: no, so these never reach the AWX fact
+    # cache. Do not add cacheable: yes here.
     - name: Set AWS STS credentials
       set_fact:
         aws_access_key: "{{ assumed_role.sts_creds.access_key }}"
         aws_secret_key: "{{ assumed_role.sts_creds.secret_key }}"
         aws_session_token: "{{ assumed_role.sts_creds.session_token }}"
+      no_log: true
 
     # ============================================================
     # PREREQUISITE VERIFICATION
@@ -206,6 +244,15 @@
       changed_when: false
       failed_when: false
 
+    # - name: Gather EC2 metadata facts natively
+    #   amazon.aws.aws_ec2_metadata_facts:
+    #   tags: cw-agent
+
+    # - name: Set instance ID fact
+    #   set_fact:
+    #     cw_instance_id: "{{ ansible_ec2_instance_id }}"
+    #   tags: cw-agent
+
     - name: Record this host's instance id
       set_fact:
         cw_instance_id: "{{ cw_instance_id_raw.stdout | default('') | trim }}"
@@ -250,17 +297,73 @@
         cw_profile_is_ours: >-
           {{ cw_profile_name in (cw_current_profile.stdout | default('') | trim) }}
 
+    # Default behaviour: stop. An instance holds exactly one profile, so
+    # attaching ours removes whatever the workload was using.
+    # cw_force_profile_replace=true is the deliberate override. The replaced
+    # ARN is printed first so it can be restored afterwards.
     - name: Fail when a different instance profile is already attached
       fail:
         msg: >-
           {{ inventory_hostname }} ({{ cw_instance_id }}) already has instance
           profile {{ cw_profile_arn }}. An instance can hold only one, so
           attaching {{ cw_profile_name }} would remove the permissions its
-          workload is currently using. Resolve this deliberately before
-          re-running.
+          workload is currently using. Re-run with
+          cw_force_profile_replace=true to replace it deliberately.
       when:
         - not (cw_profile_absent | bool)
         - not (cw_profile_is_ours | bool)
+        - not (cw_force_profile_replace | default(false) | bool)
+
+    - name: Record the instance profile about to be replaced
+      debug:
+        msg: >-
+          FORCED REPLACEMENT on {{ inventory_hostname }}
+          ({{ cw_instance_id }}): removing {{ cw_profile_arn }} and attaching
+          {{ cw_profile_name }}. Restore the original with
+          'aws ec2 replace-iam-instance-profile-association' if required.
+      when:
+        - not (cw_profile_absent | bool)
+        - not (cw_profile_is_ours | bool)
+        - cw_force_profile_replace | default(false) | bool
+
+    - name: Read the existing instance profile association id
+      shell: >
+        {{ cw_aws_cli }} ec2 describe-iam-instance-profile-associations
+        --region {{ cw_region }}
+        --filters Name=instance-id,Values={{ cw_instance_id }}
+        --query 'IamInstanceProfileAssociations[0].AssociationId'
+        --output text
+      become: true
+      become_user: root
+      become_method: su
+      become_exe: sudo su -
+      environment:
+        AWS_ACCESS_KEY_ID: "{{ aws_access_key }}"
+        AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
+        AWS_SESSION_TOKEN: "{{ aws_session_token }}"
+      register: cw_existing_assoc
+      changed_when: false
+      when:
+        - not (cw_profile_absent | bool)
+        - not (cw_profile_is_ours | bool)
+        - cw_force_profile_replace | default(false) | bool
+
+    - name: Disassociate the existing instance profile
+      shell: >
+        {{ cw_aws_cli }} ec2 disassociate-iam-instance-profile
+        --region {{ cw_region }}
+        --association-id {{ cw_existing_assoc.stdout | trim }}
+      become: true
+      become_user: root
+      become_method: su
+      become_exe: sudo su -
+      environment:
+        AWS_ACCESS_KEY_ID: "{{ aws_access_key }}"
+        AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
+        AWS_SESSION_TOKEN: "{{ aws_session_token }}"
+      when:
+        - cw_existing_assoc is not skipped
+        - (cw_existing_assoc.stdout | default('') | trim) not in ['', 'None']
 
     - name: Associate the CloudWatch instance profile
       shell: >
@@ -277,7 +380,10 @@
         AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
         AWS_SESSION_TOKEN: "{{ aws_session_token }}"
       register: cw_associate
-      when: cw_profile_absent | bool
+      when: >-
+        (cw_profile_absent | bool)
+        or (not (cw_profile_is_ours | bool)
+            and (cw_force_profile_replace | default(false) | bool))
 
     - name: Report the association id for rollback
       debug:
@@ -290,7 +396,7 @@
       pause:
         seconds: "{{ cw_profile_propagation_delay | default(60) }}"
       run_once: true
-      when: cw_profile_absent | bool
+      when: cw_associate is not skipped
 
     # ============================================================
     # AGENT INSTALL
@@ -458,3 +564,23 @@
           {{ cw_verify_metric_name }} in the last
           {{ cw_verify_window_minutes }} minutes
       when: cw_verify | bool
+
+  # ================================================================
+  # TEARDOWN
+  #
+  # Clear the assumed-role credentials from play memory once the work is
+  # done. They were never written to disk and never cached (set_fact is
+  # cacheable: no by default); this removes them from the in-memory facts
+  # as well, so nothing downstream in a longer play can read them.
+  #
+  # In `always:` so it runs even when a task above fails.
+  # ================================================================
+  always:
+    - name: Clear assumed-role credentials from memory
+      set_fact:
+        aws_access_key: ""
+        aws_secret_key: ""
+        aws_session_token: ""
+        assumed_role: {}
+      no_log: true
+      tags: cw-agent
