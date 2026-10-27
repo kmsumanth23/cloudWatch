@@ -158,19 +158,33 @@ aws eks describe-addon-versions $P --addon-name amazon-cloudwatch-observability 
 aws eks describe-addon-configuration $P --addon-name amazon-cloudwatch-observability \
   --addon-version <version-from-above> --query 'configurationSchema' --output text | head -60
 
+Association is clean — right cluster, right namespace, SA cloudwatch-agent, owned by the add-on. That part worked. But 0 metrics after 17 minutes is a real failure, not lag — Container Insights normally publishes within 1–5 minutes. Don’t wait it out.
 
-  {
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Principal": { "Service": "ec2.amazonaws.com" },
-      "Action": "sts:AssumeRole"
-    },
-    {
-      "Effect": "Allow",
-      "Principal": { "Service": "pods.eks.amazonaws.com" },
-      "Action": [ "sts:AssumeRole", "sts:TagSession" ]
-    }
-  ]
+The one prerequisite you never confirmed is still my top suspect:
+
+aws eks list-addons $P --cluster-name eks-hxsa-d-us-east-1-7
+An association is only a record. The thing that actually injects credentials into pods is the eks-pod-identity-agent add-on running on the nodes. Without it the association resolves to nothing and the agent runs with no credentials at all.
+
+Confirm it from the pod side — this is the decisive check:
+
+kubectl -n amazon-cloudwatch get pods -o wide
+
+kubectl -n amazon-cloudwatch get pods -l app.kubernetes.io/name=cloudwatch-agent \
+  -o jsonpath='{.items[0].spec.containers[0].env[*].name}' | tr ' ' '\n' | grep -i aws
+Pod Identity injects AWS_CONTAINER_CREDENTIALS_FULL_URI and AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE. If those two aren’t there, Pod Identity isn’t wired up — nothing about the role or trust policy matters yet.
+
+Then the logs, which will say outright:
+
+kubectl -n amazon-cloudwatch logs -l app.kubernetes.io/name=cloudwatch-agent --tail=50
+If the pod identity agent was missing
+Installing it is not enough on its own. Credentials are injected at pod creation, so pods that started before the agent existed stay credential-less forever:
+
+aws eks create-addon $P --cluster-name eks-hxsa-d-us-east-1-7 --addon-name eks-pod-identity-agent
+kubectl -n amazon-cloudwatch rollout restart daemonset/cloudwatch-agent
+That restart is the step people skip, then conclude Pod Identity is broken.
+
+One other possibility worth ruling out
+Metrics landing somewhere you’re not looking:
+
+aws cloudwatch list-metrics $P --query 'Metrics[].Namespace' --output text | tr '\t' '\n' | sort -u
 }
