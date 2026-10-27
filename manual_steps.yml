@@ -139,3 +139,21 @@ flowchart LR
     end
 
     R --> IP --> AS --> IN --> VF
+
+
+    P="--profile srvchxsa"
+
+# 1. Is the add-on still publishing nothing?
+aws cloudwatch list-metrics $P --namespace ContainerInsights --query 'length(Metrics)'
+
+# 2. Has the node role been fixed since?
+aws iam list-attached-role-policies $P --role-name hclsw_hxsa_eks_cluster_nodegroup_role
+
+# 3. Pod identity association added?
+aws eks list-pod-identity-associations $P --cluster-name eks-hxsa-d-us-east-1-3
+
+# 4. Does the add-on config schema accept a mem block? (tests option C)
+aws eks describe-addon-versions $P --addon-name amazon-cloudwatch-observability \
+  --query 'addons[0].addonVersions[0].addonVersion' --output text
+aws eks describe-addon-configuration $P --addon-name amazon-cloudwatch-observability \
+  --addon-version <version-from-above> --query 'configurationSchema' --output text | head -60
