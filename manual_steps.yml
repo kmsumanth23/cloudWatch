@@ -143,48 +143,16 @@ flowchart LR
 
     P="--profile srvchxsa"
 
-# 1. Is the add-on still publishing nothing?
-aws cloudwatch list-metrics $P --namespace ContainerInsights --query 'length(Metrics)'
+aws cloudwatch list-metrics $P --namespace ContainerInsights \
+  --metric-name node_memory_utilization \
+  --query 'Metrics[].Dimensions[].Name' --output text | tr '\t' '\n' | sort -u
 
-# 2. Has the node role been fixed since?
-aws iam list-attached-role-policies $P --role-name hclsw_hxsa_eks_cluster_nodegroup_role
+aws cloudwatch get-metric-statistics $P \
+  --namespace ContainerInsights --metric-name node_memory_utilization \
+  --dimensions Name=ClusterName,Value=eks-hxsa-d-us-east-1-7 \
+  --start-time $(date -u -d '30 minutes ago' +%Y-%m-%dT%H:%M:%SZ) \
+  --end-time $(date -u +%Y-%m-%dT%H:%M:%SZ) \
+  --period 300 --statistics Average Maximum
 
-# 3. Pod identity association added?
-aws eks list-pod-identity-associations $P --cluster-name eks-hxsa-d-us-east-1-3
-
-# 4. Does the add-on config schema accept a mem block? (tests option C)
-aws eks describe-addon-versions $P --addon-name amazon-cloudwatch-observability \
-  --query 'addons[0].addonVersions[0].addonVersion' --output text
-aws eks describe-addon-configuration $P --addon-name amazon-cloudwatch-observability \
-  --addon-version <version-from-above> --query 'configurationSchema' --output text | head -60
-
-Association is clean — right cluster, right namespace, SA cloudwatch-agent, owned by the add-on. That part worked. But 0 metrics after 17 minutes is a real failure, not lag — Container Insights normally publishes within 1–5 minutes. Don’t wait it out.
-
-The one prerequisite you never confirmed is still my top suspect:
-
-aws eks list-addons $P --cluster-name eks-hxsa-d-us-east-1-7
-An association is only a record. The thing that actually injects credentials into pods is the eks-pod-identity-agent add-on running on the nodes. Without it the association resolves to nothing and the agent runs with no credentials at all.
-
-Confirm it from the pod side — this is the decisive check:
-
-kubectl -n amazon-cloudwatch get pods -o wide
-
-kubectl -n amazon-cloudwatch get pods -l app.kubernetes.io/name=cloudwatch-agent \
-  -o jsonpath='{.items[0].spec.containers[0].env[*].name}' | tr ' ' '\n' | grep -i aws
-Pod Identity injects AWS_CONTAINER_CREDENTIALS_FULL_URI and AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE. If those two aren’t there, Pod Identity isn’t wired up — nothing about the role or trust policy matters yet.
-
-Then the logs, which will say outright:
-
-kubectl -n amazon-cloudwatch logs -l app.kubernetes.io/name=cloudwatch-agent --tail=50
-If the pod identity agent was missing
-Installing it is not enough on its own. Credentials are injected at pod creation, so pods that started before the agent existed stay credential-less forever:
-
-aws eks create-addon $P --cluster-name eks-hxsa-d-us-east-1-7 --addon-name eks-pod-identity-agent
-kubectl -n amazon-cloudwatch rollout restart daemonset/cloudwatch-agent
-That restart is the step people skip, then conclude Pod Identity is broken.
-
-One other possibility worth ruling out
-Metrics landing somewhere you’re not looking:
-
-aws cloudwatch list-metrics $P --query 'Metrics[].Namespace' --output text | tr '\t' '\n' | sort -u
-}
+kubectl -n amazon-cloudwatch get ds cloudwatch-agent
+kubectl get nodes
