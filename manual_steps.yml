@@ -157,3 +157,20 @@ aws eks describe-addon-versions $P --addon-name amazon-cloudwatch-observability 
   --query 'addons[0].addonVersions[0].addonVersion' --output text
 aws eks describe-addon-configuration $P --addon-name amazon-cloudwatch-observability \
   --addon-version <version-from-above> --query 'configurationSchema' --output text | head -60
+
+
+  {
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": { "Service": "ec2.amazonaws.com" },
+      "Action": "sts:AssumeRole"
+    },
+    {
+      "Effect": "Allow",
+      "Principal": { "Service": "pods.eks.amazonaws.com" },
+      "Action": [ "sts:AssumeRole", "sts:TagSession" ]
+    }
+  ]
+}
