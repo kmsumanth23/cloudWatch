@@ -36,23 +36,31 @@
          | default('HCLSW_AWS_' ~ (client_code | upper) ~ '_EC2_CLOUDWATCH_FULLACCESS_SVC_PROFILE', true) }}
     cw_region: "{{ cw_region | default(aws_region, true) }}"
     cw_aws_cli: "{{ cw_aws_cli | default('/usr/local/bin/aws', true) }}"
-  tags: cw-agent
+  tags: [cw-agent, cw-eks]
 
 # ==================================================================
 # GATE
 #
-# The client environment vars file is read for ONE flag. Its only purpose
-# here is to say whether this environment has opted in.
+# The client environment vars file is read for the opt-in flags and for
+# cw_eks_clusters. Those three values cannot arrive any other way: this
+# play cannot load that file as ordinary vars (see below), so anything a
+# client environment must tell this play has to come out of this one read.
 #
 # Read with the custom-delimiter template trick used by
 # awx-workflow-certs-aws.yml: aws-client-vars-env.yml contains regular
 # {{ }} references (security_groups, aws_subnets_custom, ...) that would
 # raise undefined-variable errors if rendered in this play's context.
 # ==================================================================
+- name: Resolve EKS add-on naming and settings
+  set_fact:
+    cw_eks_flag_name: "{{ cw_eks_flag_name | default('cloudwatch_eks_addon', true) }}"
+    cw_eks_role_name: "{{ cw_eks_role_name | default(cw_role_name, true) }}"
+  tags: [cw-agent, cw-eks]
+
 - name: Resolve the client environment vars file path
   set_fact:
     cw_client_env_file: "{{ client_vars_directory }}/{{ client_code }}/{{ client_env }}/aws-client-vars-env.yml"
-  tags: cw-agent
+  tags: [cw-agent, cw-eks]
 
 # - name: Read the CloudWatch agent flag from the client environment vars file
 #   set_fact:
@@ -73,18 +81,23 @@
     cw_raw_content: "{{ lookup('file', cw_client_env_file, errors='ignore') | default('', true) }}"
   delegate_to: localhost
   no_log: true
-  tags: cw-agent
+  tags: [cw-agent, cw-eks]
 
 - name: Parse and evaluate CloudWatch agent flag
   set_fact:
     cw_enabled: >-
       {{ (cw_raw_content | from_yaml | default({}, true)).get(cw_agent_flag_name, false) | bool }}
-  tags: cw-agent
+    cw_eks_enabled: >-
+      {{ (cw_raw_content | from_yaml | default({}, true)).get(cw_eks_flag_name, false) | bool }}
+    cw_eks_clusters: >-
+      {{ (cw_raw_content | from_yaml | default({}, true)).get('cw_eks_clusters',
+         cw_eks_clusters | default([], true)) }}
+  tags: [cw-agent, cw-eks]
 
 - name: Discard the client environment file content
   set_fact:
     cw_raw_content: ""
-  tags: cw-agent
+  tags: [cw-agent, cw-eks]
 
 # - name: DEBUG - Check what the lookup is returning
 #   debug:
@@ -101,7 +114,17 @@
       ({{ cw_client_env_file }})
       {{ '- proceeding' if (cw_enabled | bool) else '- not enabled, skipping' }}
   run_once: true
-  tags: cw-agent
+  tags: [cw-agent, cw-eks]
+
+- name: Report the EKS add-on decision for this client environment
+  debug:
+    msg: >-
+      {{ client_code }}/{{ client_env }}:
+      {{ cw_eks_flag_name }}={{ cw_eks_enabled }}
+      {{ '- proceeding for ' ~ (cw_eks_clusters | join(', '))
+         if (cw_eks_enabled | bool) else '- not enabled, skipping' }}
+  run_once: true
+  tags: [cw-agent, cw-eks]
 
 - name: Install and configure the CloudWatch agent
   when: cw_enabled | bool
@@ -584,3 +607,454 @@
         assumed_role: {}
       no_log: true
       tags: cw-agent
+
+# ==================================================================
+# EKS CLOUDWATCH OBSERVABILITY ADD-ON
+#
+# Publishes node_memory_utilization for EKS worker nodes: the EKS
+# counterpart of the mem_used_percent work above. Separate flag and separate
+# block, because a client environment may want either, both or neither.
+#
+# Runs run_once against the play's first host, with the same assumed-role
+# credentials, AWS CLI path and become stanza as the EC2 work. That host has
+# no relationship to the cluster; it is only where the API calls are issued
+# from. EKS clusters are not in the AWX inventory and are never discovered.
+#
+# NO kubectl, deliberately. Installing eks-pod-identity-agent BEFORE the
+# observability add-on means the cloudwatch-agent pods are created after the
+# credential endpoint exists, so no rollout restart is ever required.
+# Reversing that order produces an add-on that reports ACTIVE and publishes
+# nothing, and recovering from it needs cluster RBAC this play does not have.
+#
+# PREREQUISITE, owned by the IAM team and NOT performed here: the role must
+# trust pods.eks.amazonaws.com with BOTH sts:AssumeRole and sts:TagSession.
+# Verified below, never created.
+# ==================================================================
+- name: Configure the EKS CloudWatch observability add-on
+  when: cw_eks_enabled | bool
+  tags: cw-eks
+  block:
+
+    - name: Fail when no EKS clusters are named for this client environment
+      fail:
+        msg: >-
+          {{ cw_eks_flag_name }} is true for {{ client_code }}/{{ client_env }}
+          but cw_eks_clusters is empty. Name the clusters in
+          {{ cw_client_env_file }}. Clusters are never discovered: one AWS
+          account holds several environments, and `aws eks list-clusters`
+          would return every one of them.
+      when: cw_eks_clusters | length == 0
+      run_once: true
+
+    # ============================================================
+    # AUTHENTICATION
+    #
+    # A second assume-role rather than a shared one. The EC2 block above
+    # clears its credentials in always:, so they are gone by the time this
+    # runs, and this block must work when cw_enabled is false and that block
+    # never ran at all.
+    # ============================================================
+    - name: Get authentication session details for the EKS work
+      sts_assume_role:
+        role_arn: "{{ arn_auto_admin_val }}"
+        role_session_name: operstssess0
+        aws_access_key: "{{ access_val }}"
+        aws_secret_key: "{{ sec_val }}"
+        duration_seconds: 3600
+        aws_region: "{{ aws_region }}"
+      register: cw_eks_assumed_role
+      delegate_to: localhost
+      run_once: true
+      no_log: true
+
+    - name: Set AWS STS credentials for the EKS work
+      set_fact:
+        aws_access_key: "{{ cw_eks_assumed_role.sts_creds.access_key }}"
+        aws_secret_key: "{{ cw_eks_assumed_role.sts_creds.secret_key }}"
+        aws_session_token: "{{ cw_eks_assumed_role.sts_creds.session_token }}"
+      no_log: true
+
+    # ============================================================
+    # PREREQUISITE VERIFICATION
+    #
+    # Pod Identity fails silently when the trust policy is incomplete: the
+    # association is created, the add-on reports ACTIVE, and nothing is ever
+    # published. Checked before anything is created.
+    # ============================================================
+    - name: Read the EKS CloudWatch IAM role
+      shell: >
+        {{ cw_aws_cli }} iam get-role --role-name {{ cw_eks_role_name }}
+      become: true
+      become_user: root
+      become_method: su
+      become_exe: sudo su -
+      environment:
+        AWS_ACCESS_KEY_ID: "{{ aws_access_key }}"
+        AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
+        AWS_SESSION_TOKEN: "{{ aws_session_token }}"
+      register: cw_eks_role_check
+      changed_when: false
+      failed_when: false
+      run_once: true
+
+    - name: Fail when the EKS CloudWatch IAM role does not exist
+      fail:
+        msg: >-
+          IAM role {{ cw_eks_role_name }} was not found in this account. It is
+          a prerequisite created by the IAM team. AWS reported:
+          {{ cw_eks_role_check.stderr | default('') | trim }}
+      when: cw_eks_role_check.rc != 0
+      run_once: true
+
+    # Each trust statement is serialised and matched as text. Principal.Service
+    # is a string for one principal and a list for several, so navigating it as
+    # an attribute breaks on whichever shape was not anticipated.
+    - name: Select the trust statements naming the EKS Pod Identity principal
+      set_fact:
+        cw_eks_trust_stmts: >-
+          {{ (cw_eks_role_check.stdout | from_json).Role.AssumeRolePolicyDocument.Statement
+             | selectattr('Effect', 'equalto', 'Allow')
+             | map('to_json') | select('search', 'pods\.eks\.amazonaws\.com')
+             | list }}
+        cw_eks_role_arn: "{{ (cw_eks_role_check.stdout | from_json).Role.Arn }}"
+      run_once: true
+
+    - name: Fail when the role does not trust the EKS Pod Identity principal
+      fail:
+        msg: >-
+          Role {{ cw_eks_role_name }} does not trust pods.eks.amazonaws.com.
+          Pod Identity cannot hand its credentials to the agent. Ask the IAM
+          team to add this statement to the role's trust policy, keeping the
+          existing ec2.amazonaws.com statement intact:
+          {"Effect":"Allow","Principal":{"Service":"pods.eks.amazonaws.com"},"Action":["sts:AssumeRole","sts:TagSession"]}
+      when: cw_eks_trust_stmts | length == 0
+      run_once: true
+
+    - name: Fail when the EKS trust statement omits sts:TagSession
+      fail:
+        msg: >-
+          Role {{ cw_eks_role_name }} trusts pods.eks.amazonaws.com but its
+          statement does not grant sts:TagSession. Pod Identity requires BOTH
+          sts:AssumeRole and sts:TagSession; with only the first, the add-on
+          reports ACTIVE and publishes nothing. Ask the IAM team to add it.
+      when: cw_eks_trust_stmts | select('search', 'sts:TagSession') | list | length == 0
+      run_once: true
+
+    - name: Read the policies attached to the EKS CloudWatch role
+      shell: >
+        {{ cw_aws_cli }} iam list-attached-role-policies
+        --role-name {{ cw_eks_role_name }}
+        --query 'AttachedPolicies[].PolicyName' --output text
+      become: true
+      become_user: root
+      become_method: su
+      become_exe: sudo su -
+      environment:
+        AWS_ACCESS_KEY_ID: "{{ aws_access_key }}"
+        AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
+        AWS_SESSION_TOKEN: "{{ aws_session_token }}"
+      register: cw_eks_role_policies
+      changed_when: false
+      failed_when: false
+      run_once: true
+
+    - name: Fail when CloudWatchAgentServerPolicy is not attached to the role
+      fail:
+        msg: >-
+          Role {{ cw_eks_role_name }} does not have {{ cw_eks_required_policy }}
+          attached. Container Insights ships metrics as embedded-metric-format
+          log events, so without the Logs write actions in that policy no
+          metrics appear at all. Attached now:
+          {{ cw_eks_role_policies.stdout | default('(none)') | trim }}
+      when: cw_eks_required_policy not in (cw_eks_role_policies.stdout | default(''))
+      run_once: true
+
+    # ============================================================
+    # POD IDENTITY AGENT
+    #
+    # Must be ACTIVE before the observability add-on is created. It is the
+    # node-local DaemonSet that serves credentials at 169.254.170.23. The
+    # EKS Pod Identity webhook injects AWS_CONTAINER_CREDENTIALS_FULL_URI
+    # into the agent pod as soon as an association exists, whether or not
+    # anything is listening on that address — so the presence of those
+    # environment variables proves nothing, and this add-on is what the
+    # check has to be against.
+    # ============================================================
+    - name: Read the EKS Pod Identity agent add-on status
+      shell: >
+        {{ cw_aws_cli }} eks describe-addon
+        --region {{ cw_region }}
+        --cluster-name {{ item }}
+        --addon-name {{ cw_eks_identity_addon }}
+        --query 'addon.status' --output text
+      become: true
+      become_user: root
+      become_method: su
+      become_exe: sudo su -
+      environment:
+        AWS_ACCESS_KEY_ID: "{{ aws_access_key }}"
+        AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
+        AWS_SESSION_TOKEN: "{{ aws_session_token }}"
+      register: cw_eks_identity_status
+      loop: "{{ cw_eks_clusters }}"
+      changed_when: false
+      failed_when: false
+      run_once: true
+
+    - name: Install the EKS Pod Identity agent add-on where it is absent
+      shell: >
+        {{ cw_aws_cli }} eks create-addon
+        --region {{ cw_region }}
+        --cluster-name {{ item.item }}
+        --addon-name {{ cw_eks_identity_addon }}
+      become: true
+      become_user: root
+      become_method: su
+      become_exe: sudo su -
+      environment:
+        AWS_ACCESS_KEY_ID: "{{ aws_access_key }}"
+        AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
+        AWS_SESSION_TOKEN: "{{ aws_session_token }}"
+      loop: "{{ cw_eks_identity_status.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when: item.rc != 0
+      register: cw_eks_identity_create
+      changed_when: cw_eks_identity_create.rc == 0
+      failed_when: >-
+        cw_eks_identity_create.rc != 0
+        and 'ResourceInUseException' not in (cw_eks_identity_create.stderr | default(''))
+      run_once: true
+
+    - name: Wait for the EKS Pod Identity agent add-on to become active
+      shell: >
+        {{ cw_aws_cli }} eks describe-addon
+        --region {{ cw_region }}
+        --cluster-name {{ item }}
+        --addon-name {{ cw_eks_identity_addon }}
+        --query 'addon.status' --output text
+      become: true
+      become_user: root
+      become_method: su
+      become_exe: sudo su -
+      environment:
+        AWS_ACCESS_KEY_ID: "{{ aws_access_key }}"
+        AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
+        AWS_SESSION_TOKEN: "{{ aws_session_token }}"
+      register: cw_eks_identity_ready
+      loop: "{{ cw_eks_clusters }}"
+      until: (cw_eks_identity_ready.stdout | default('') | trim) == 'ACTIVE'
+      retries: "{{ cw_eks_addon_retries | int }}"
+      delay: "{{ cw_eks_addon_delay | int }}"
+      changed_when: false
+      run_once: true
+
+    # ============================================================
+    # OBSERVABILITY ADD-ON
+    #
+    # An add-on that already exists is left alone: its configuration may have
+    # been tuned by hand, and re-creating it would discard that. Set
+    # cw_eks_force_recreate at launch to replace one that exists but is not
+    # publishing — the only API-only way to restart its pods.
+    # ============================================================
+    - name: Read the EKS CloudWatch observability add-on status
+      shell: >
+        {{ cw_aws_cli }} eks describe-addon
+        --region {{ cw_region }}
+        --cluster-name {{ item }}
+        --addon-name {{ cw_eks_addon_name }}
+        --query 'addon.status' --output text
+      become: true
+      become_user: root
+      become_method: su
+      become_exe: sudo su -
+      environment:
+        AWS_ACCESS_KEY_ID: "{{ aws_access_key }}"
+        AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
+        AWS_SESSION_TOKEN: "{{ aws_session_token }}"
+      register: cw_eks_addon_status
+      loop: "{{ cw_eks_clusters }}"
+      changed_when: false
+      failed_when: false
+      run_once: true
+
+    - name: Report the EKS observability add-on state before any change
+      debug:
+        msg: >-
+          {{ item.item }}:
+          {{ cw_eks_addon_name }} =
+          {{ (item.stdout | trim) if item.rc == 0 else 'ABSENT' }}
+          {{ '- will be recreated (cw_eks_force_recreate)'
+             if (item.rc == 0 and (cw_eks_force_recreate | bool))
+             else ('- will be installed' if item.rc != 0 else '- left as is') }}
+      loop: "{{ cw_eks_addon_status.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      run_once: true
+
+    - name: Remove the EKS observability add-on before recreating it
+      shell: >
+        {{ cw_aws_cli }} eks delete-addon
+        --region {{ cw_region }}
+        --cluster-name {{ item.item }}
+        --addon-name {{ cw_eks_addon_name }}
+      become: true
+      become_user: root
+      become_method: su
+      become_exe: sudo su -
+      environment:
+        AWS_ACCESS_KEY_ID: "{{ aws_access_key }}"
+        AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
+        AWS_SESSION_TOKEN: "{{ aws_session_token }}"
+      loop: "{{ cw_eks_addon_status.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when:
+        - cw_eks_force_recreate | bool
+        - item.rc == 0
+      run_once: true
+
+    - name: Wait for the removed add-on to disappear
+      shell: >
+        {{ cw_aws_cli }} eks describe-addon
+        --region {{ cw_region }}
+        --cluster-name {{ item.item }}
+        --addon-name {{ cw_eks_addon_name }}
+        --query 'addon.status' --output text
+      become: true
+      become_user: root
+      become_method: su
+      become_exe: sudo su -
+      environment:
+        AWS_ACCESS_KEY_ID: "{{ aws_access_key }}"
+        AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
+        AWS_SESSION_TOKEN: "{{ aws_session_token }}"
+      register: cw_eks_addon_gone
+      loop: "{{ cw_eks_addon_status.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when:
+        - cw_eks_force_recreate | bool
+        - item.rc == 0
+      until: cw_eks_addon_gone.rc != 0
+      retries: "{{ cw_eks_addon_retries | int }}"
+      delay: "{{ cw_eks_addon_delay | int }}"
+      changed_when: false
+      failed_when: false
+      run_once: true
+
+    # --pod-identity-associations is what binds the role to the
+    # amazon-cloudwatch/cloudwatch-agent service account. Without it the
+    # add-on installs and runs with no credentials at all.
+    - name: Install the EKS CloudWatch observability add-on
+      shell: >
+        {{ cw_aws_cli }} eks create-addon
+        --region {{ cw_region }}
+        --cluster-name {{ item.item }}
+        --addon-name {{ cw_eks_addon_name }}
+        {{ ('--addon-version ' ~ cw_eks_addon_version) if cw_eks_addon_version else '' }}
+        --pod-identity-associations
+        serviceAccount={{ cw_eks_service_account }},roleArn={{ cw_eks_role_arn }}
+      become: true
+      become_user: root
+      become_method: su
+      become_exe: sudo su -
+      environment:
+        AWS_ACCESS_KEY_ID: "{{ aws_access_key }}"
+        AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
+        AWS_SESSION_TOKEN: "{{ aws_session_token }}"
+      loop: "{{ cw_eks_addon_status.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when: item.rc != 0 or (cw_eks_force_recreate | bool)
+      register: cw_eks_addon_create
+      changed_when: cw_eks_addon_create.rc == 0
+      failed_when: >-
+        cw_eks_addon_create.rc != 0
+        and 'ResourceInUseException' not in (cw_eks_addon_create.stderr | default(''))
+      run_once: true
+
+    - name: Wait for the EKS CloudWatch observability add-on to become active
+      shell: >
+        {{ cw_aws_cli }} eks describe-addon
+        --region {{ cw_region }}
+        --cluster-name {{ item }}
+        --addon-name {{ cw_eks_addon_name }}
+        --query 'addon.status' --output text
+      become: true
+      become_user: root
+      become_method: su
+      become_exe: sudo su -
+      environment:
+        AWS_ACCESS_KEY_ID: "{{ aws_access_key }}"
+        AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
+        AWS_SESSION_TOKEN: "{{ aws_session_token }}"
+      register: cw_eks_addon_ready
+      loop: "{{ cw_eks_clusters }}"
+      until: (cw_eks_addon_ready.stdout | default('') | trim) == 'ACTIVE'
+      retries: "{{ cw_eks_addon_retries | int }}"
+      delay: "{{ cw_eks_addon_delay | int }}"
+      changed_when: false
+      run_once: true
+
+    # ============================================================
+    # VERIFICATION
+    #
+    # The only step that proves the system works. An ACTIVE add-on with a
+    # correct association published nothing for an hour during the pilot
+    # because the Pod Identity agent was missing; every status check above
+    # passed throughout. Queries the metric actually wanted, for the cluster
+    # actually configured.
+    # ============================================================
+    - name: Wait for node memory datapoints to arrive in CloudWatch
+      shell: >
+        {{ cw_aws_cli }} cloudwatch get-metric-statistics
+        --region {{ cw_region }}
+        --namespace {{ cw_eks_verify_namespace }}
+        --metric-name {{ cw_eks_verify_metric }}
+        --dimensions Name=ClusterName,Value={{ item }}
+        --start-time $(date -u -d '{{ cw_eks_verify_window_minutes }} minutes ago' +%Y-%m-%dT%H:%M:%SZ)
+        --end-time $(date -u +%Y-%m-%dT%H:%M:%SZ)
+        --period 300
+        --statistics Average
+        --query 'length(Datapoints)'
+        --output text
+      become: true
+      become_user: root
+      become_method: su
+      become_exe: sudo su -
+      environment:
+        AWS_ACCESS_KEY_ID: "{{ aws_access_key }}"
+        AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
+        AWS_SESSION_TOKEN: "{{ aws_session_token }}"
+      register: cw_eks_datapoints
+      loop: "{{ cw_eks_clusters }}"
+      until: (cw_eks_datapoints.stdout | default('0') | trim | int) > 0
+      retries: "{{ cw_eks_verify_retries | int }}"
+      delay: "{{ cw_eks_verify_delay | int }}"
+      changed_when: false
+      when: cw_eks_verify | bool
+      run_once: true
+
+    - name: Report the EKS result for each cluster
+      debug:
+        msg: >-
+          {{ item.item }}:
+          {{ item.stdout | default('0') | trim }} datapoint(s) of
+          {{ cw_eks_verify_metric }} in the last
+          {{ cw_eks_verify_window_minutes }} minutes
+      loop: "{{ cw_eks_datapoints.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when: cw_eks_verify | bool
+      run_once: true
+
+  always:
+    - name: Clear assumed-role credentials from memory after the EKS work
+      set_fact:
+        aws_access_key: ""
+        aws_secret_key: ""
+        aws_session_token: ""
+        cw_eks_assumed_role: {}
+      no_log: true
+      tags: cw-eks
