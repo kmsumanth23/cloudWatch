@@ -1,13 +1,13 @@
 {
   "agent": {
     "metrics_collection_interval": {{ cw_agent_interval | int }},
-    "run_as_user": "{{ cw_agent_run_as_user }}",
-    "debug": {{ cw_agent_debug | bool | to_json }}
+    "run_as_user": "cwagent",
+    "debug": false
   },
   "metrics": {
     "namespace": "{{ cw_agent_namespace }}",
-    "append_dimensions": {{ cw_agent_append_dimensions | to_json }},
-    "aggregation_dimensions": {{ cw_agent_aggregation_dimensions | to_json }},
+    "append_dimensions": {"InstanceId": "${aws:InstanceId}"},
+    "aggregation_dimensions": [["InstanceId"]],
     "metrics_collected": {
 {% for group, cfg in cw_agent_metrics_collected.items() %}
       "{{ group }}": {
