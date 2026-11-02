@@ -106,3 +106,78 @@ cw_verify_metric_name: mem_used_percent
 cw_verify_window_minutes: 15
 cw_verify_retries: 10
 cw_verify_delay: 30
+
+# ============================================================================
+# EKS CLOUDWATCH OBSERVABILITY ADD-ON
+#
+# Node memory for EKS worker nodes. Independent of the EC2 agent above: a
+# client environment may enable either, both or neither.
+# ============================================================================
+
+# Flag read from the client environment vars file, out of the same single read
+# that resolves cloudwatch_agent. Setting it true there is how an environment
+# opts in.
+cw_eks_flag_name: cloudwatch_eks_addon
+
+# Clusters to configure, named explicitly per client environment, IN
+# aws-client-vars-env.yml:
+#   cw_eks_clusters:
+#     - eks-hxsa-d-us-east-1-7
+#
+# It is read out of the same raw read as the opt-in flags, not through the
+# normal vars chain. That file cannot be loaded as ordinary vars in this play
+# -- it contains {{ }} references that do not resolve in this context -- so a
+# list placed there is invisible to every other mechanism. A job can still
+# override it with -e cw_eks_clusters='[...]', which outranks the read.
+#
+# NEVER discovered. One AWS account holds several of our environments, so
+# `aws eks list-clusters` would return other environments' clusters and this
+# play would reconfigure them. Empty with the flag true is a hard failure.
+cw_eks_clusters: []
+
+# Defaults to cw_role_name — the same role the EC2 agent uses, which is the
+# current arrangement. Set it here only if EC2 and EKS roles are ever split.
+#
+# The role needs an ADDITIONAL trust statement beyond the EC2 one:
+#   {"Effect":"Allow",
+#    "Principal":{"Service":"pods.eks.amazonaws.com"},
+#    "Action":["sts:AssumeRole","sts:TagSession"]}
+# Both actions. With only sts:AssumeRole the add-on reports ACTIVE and
+# publishes nothing. Created by the IAM team; verified, never created, here.
+# cw_eks_role_name: ""
+
+cw_eks_required_policy: CloudWatchAgentServerPolicy
+cw_eks_namespace: amazon-cloudwatch
+cw_eks_service_account: cloudwatch-agent
+
+cw_eks_addon_name: amazon-cloudwatch-observability
+
+# The node-local DaemonSet that serves credentials at 169.254.170.23. Ordered
+# FIRST on purpose: the cloudwatch-agent pods must be created after it exists,
+# otherwise they hold credential environment variables pointing at an address
+# with nothing listening, and only a pod restart recovers them. Installing in
+# this order is what keeps kubectl out of this play entirely.
+cw_eks_identity_addon: eks-pod-identity-agent
+
+# Empty tracks the default version AWS publishes for the cluster's Kubernetes
+# version. The version exercised during the pilot was v6.7.0-eksbuild.1.
+cw_eks_addon_version: ""
+
+# An add-on that already exists is left alone. Set true at launch to delete
+# and recreate one that exists but publishes nothing — the only way to restart
+# its pods through the API, and the recovery path for an add-on that was
+# installed before the Pod Identity agent existed.
+cw_eks_force_recreate: false
+
+cw_eks_addon_retries: 30
+cw_eks_addon_delay: 20
+
+# --- verification -----------------------------------------------------------
+# An ACTIVE add-on with a correct pod identity association published nothing
+# for an hour during the pilot. Every status check passed the whole time.
+cw_eks_verify: true
+cw_eks_verify_namespace: ContainerInsights
+cw_eks_verify_metric: node_memory_utilization
+cw_eks_verify_window_minutes: 20
+cw_eks_verify_retries: 20
+cw_eks_verify_delay: 30
