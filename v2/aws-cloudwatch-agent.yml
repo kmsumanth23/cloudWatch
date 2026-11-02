@@ -116,13 +116,22 @@
   run_once: true
   tags: [cw-agent, cw-eks]
 
+- name: Resolve the EKS cluster list given at launch or in the environment file
+  set_fact:
+    cw_eks_targets: >-
+      {{ ((cw_eks_clusters | from_yaml) or []) if (cw_eks_clusters is string)
+         else (cw_eks_clusters | default([], true)) }}
+  tags: [cw-agent, cw-eks]
+
 - name: Report the EKS add-on decision for this client environment
   debug:
     msg: >-
       {{ client_code }}/{{ client_env }}:
       {{ cw_eks_flag_name }}={{ cw_eks_enabled }}
-      {{ '- proceeding for ' ~ (cw_eks_clusters | join(', '))
-         if (cw_eks_enabled | bool) else '- not enabled, skipping' }}
+      {{ ('- proceeding, clusters: ' ~ (cw_eks_targets | join(', ')))
+         if (cw_eks_enabled | bool and cw_eks_targets | length > 0)
+         else ('- proceeding, cluster discovered from the host VPC'
+               if (cw_eks_enabled | bool) else '- not enabled, skipping') }}
   run_once: true
   tags: [cw-agent, cw-eks]
 
@@ -618,7 +627,8 @@
 # Runs run_once against the play's first host, with the same assumed-role
 # credentials, AWS CLI path and become stanza as the EC2 work. That host has
 # no relationship to the cluster; it is only where the API calls are issued
-# from. EKS clusters are not in the AWX inventory and are never discovered.
+# from. EKS clusters are not in the AWX inventory; which cluster to
+# configure is discovered from that host's VPC (see CLUSTER DISCOVERY).
 #
 # NO kubectl, deliberately. Installing eks-pod-identity-agent BEFORE the
 # observability add-on means the cloudwatch-agent pods are created after the
@@ -634,17 +644,6 @@
   when: cw_eks_enabled | bool
   tags: cw-eks
   block:
-
-    - name: Fail when no EKS clusters are named for this client environment
-      fail:
-        msg: >-
-          {{ cw_eks_flag_name }} is true for {{ client_code }}/{{ client_env }}
-          but cw_eks_clusters is empty. Name the clusters in
-          {{ cw_client_env_file }}. Clusters are never discovered: one AWS
-          account holds several environments, and `aws eks list-clusters`
-          would return every one of them.
-      when: cw_eks_clusters | length == 0
-      run_once: true
 
     # ============================================================
     # AUTHENTICATION
@@ -673,6 +672,140 @@
         aws_secret_key: "{{ cw_eks_assumed_role.sts_creds.secret_key }}"
         aws_session_token: "{{ cw_eks_assumed_role.sts_creds.session_token }}"
       no_log: true
+
+    # ============================================================
+    # CLUSTER DISCOVERY
+    #
+    # Which clusters this job configures is derived from where the job is
+    # already running: the VPC of the host run_once picked. Each environment
+    # has its own VPC, so the cluster sharing it is this environment's.
+    #
+    # Nothing is typed anywhere. The account holds other environments'
+    # clusters and they are filtered out by VPC, not by name.
+    #
+    # Tags were the obvious alternative and are not usable: every cluster in
+    # the account carries an empty tag set.
+    #
+    # Skipped entirely when cw_eks_clusters is already set, so a launch-time
+    # -e '{"cw_eks_clusters":["name"]}' wins for an environment where the VPC
+    # assumption does not hold.
+    # ============================================================
+    - name: Discover this environment's EKS cluster
+      when: cw_eks_targets | length == 0
+      block:
+
+        - name: Read the VPC of the host this job is running from
+          shell: |
+            T=$(curl -s -m 5 -X PUT "http://169.254.169.254/latest/api/token" \
+                 -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+            if [ -n "$T" ]; then
+              M=$(curl -s -m 5 -H "X-aws-ec2-metadata-token: $T" \
+                   http://169.254.169.254/latest/meta-data/mac)
+              curl -s -m 5 -H "X-aws-ec2-metadata-token: $T" \
+                "http://169.254.169.254/latest/meta-data/network/interfaces/macs/$M/vpc-id"
+            else
+              M=$(curl -s -m 5 http://169.254.169.254/latest/meta-data/mac)
+              curl -s -m 5 \
+                "http://169.254.169.254/latest/meta-data/network/interfaces/macs/$M/vpc-id"
+            fi
+          register: cw_eks_vpc_raw
+          changed_when: false
+          failed_when: false
+          run_once: true
+
+        - name: Record the VPC used to scope discovery
+          set_fact:
+            cw_eks_vpc_id: "{{ cw_eks_vpc_raw.stdout | default('') | trim }}"
+          run_once: true
+
+        - name: Fail when the VPC could not be read from IMDS
+          fail:
+            msg: >-
+              Could not read the VPC id from IMDS on {{ inventory_hostname }}.
+              IMDS may be disabled or hop-limited. Name the cluster at launch
+              instead: -e '{"cw_eks_clusters":["<cluster-name>"]}'
+          when: cw_eks_vpc_id | length == 0
+          run_once: true
+
+        - name: List the EKS clusters in this account
+          shell: >
+            {{ cw_aws_cli }} eks list-clusters
+            --region {{ cw_region }}
+            --query 'clusters[]' --output text
+          become: true
+          become_user: root
+          become_method: su
+          become_exe: sudo su -
+          environment:
+            AWS_ACCESS_KEY_ID: "{{ aws_access_key }}"
+            AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
+            AWS_SESSION_TOKEN: "{{ aws_session_token }}"
+          register: cw_eks_account_clusters
+          changed_when: false
+          run_once: true
+
+        - name: Read the VPC of each cluster in the account
+          shell: >
+            {{ cw_aws_cli }} eks describe-cluster
+            --region {{ cw_region }}
+            --name {{ item }}
+            --query 'cluster.resourcesVpcConfig.vpcId'
+            --output text
+          become: true
+          become_user: root
+          become_method: su
+          become_exe: sudo su -
+          environment:
+            AWS_ACCESS_KEY_ID: "{{ aws_access_key }}"
+            AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
+            AWS_SESSION_TOKEN: "{{ aws_session_token }}"
+          loop: "{{ (cw_eks_account_clusters.stdout | default('')).split() }}"
+          register: cw_eks_cluster_vpcs
+          changed_when: false
+          run_once: true
+
+        - name: Keep the clusters that share this host's VPC
+          set_fact:
+            cw_eks_discovered: >-
+              {{ cw_eks_cluster_vpcs.results
+                 | selectattr('stdout', 'defined')
+                 | selectattr('stdout', 'search', '^' ~ cw_eks_vpc_id ~ '\s*$')
+                 | map(attribute='item') | list }}
+          run_once: true
+
+        - name: Fail when no cluster in this account shares the host's VPC
+          fail:
+            msg: >-
+              No EKS cluster is in {{ cw_eks_vpc_id }}, the VPC of
+              {{ inventory_hostname }}. Clusters in this account:
+              {{ (cw_eks_account_clusters.stdout | default('(none)')).split() | join(', ') }}.
+              If this environment's cluster is in another VPC, name it at
+              launch: -e '{"cw_eks_clusters":["<cluster-name>"]}'
+          when: cw_eks_discovered | length == 0
+          run_once: true
+
+        - name: Fail when more than one cluster shares the host's VPC
+          fail:
+            msg: >-
+              {{ cw_eks_discovered | length }} clusters share
+              {{ cw_eks_vpc_id }}: {{ cw_eks_discovered | join(', ') }}.
+              Discovery will not choose between them. Name the one you want:
+              -e '{"cw_eks_clusters":["<cluster-name>"]}'
+          when: cw_eks_discovered | length > 1
+          run_once: true
+
+        - name: Use the discovered cluster
+          set_fact:
+            cw_eks_targets: "{{ cw_eks_discovered }}"
+          run_once: true
+
+    - name: Report the clusters this job will configure
+      debug:
+        msg: >-
+          {{ client_code }}/{{ client_env }}: {{ cw_eks_targets | join(', ') }}
+          {{ '(discovered from ' ~ cw_eks_vpc_id ~ ')'
+             if cw_eks_vpc_id is defined else '(named at launch)' }}
+      run_once: true
 
     # ============================================================
     # PREREQUISITE VERIFICATION
@@ -796,7 +929,7 @@
         AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
         AWS_SESSION_TOKEN: "{{ aws_session_token }}"
       register: cw_eks_identity_status
-      loop: "{{ cw_eks_clusters }}"
+      loop: "{{ cw_eks_targets }}"
       changed_when: false
       failed_when: false
       run_once: true
@@ -842,7 +975,7 @@
         AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
         AWS_SESSION_TOKEN: "{{ aws_session_token }}"
       register: cw_eks_identity_ready
-      loop: "{{ cw_eks_clusters }}"
+      loop: "{{ cw_eks_targets }}"
       until: (cw_eks_identity_ready.stdout | default('') | trim) == 'ACTIVE'
       retries: "{{ cw_eks_addon_retries | int }}"
       delay: "{{ cw_eks_addon_delay | int }}"
@@ -873,7 +1006,7 @@
         AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
         AWS_SESSION_TOKEN: "{{ aws_session_token }}"
       register: cw_eks_addon_status
-      loop: "{{ cw_eks_clusters }}"
+      loop: "{{ cw_eks_targets }}"
       changed_when: false
       failed_when: false
       run_once: true
@@ -990,7 +1123,7 @@
         AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
         AWS_SESSION_TOKEN: "{{ aws_session_token }}"
       register: cw_eks_addon_ready
-      loop: "{{ cw_eks_clusters }}"
+      loop: "{{ cw_eks_targets }}"
       until: (cw_eks_addon_ready.stdout | default('') | trim) == 'ACTIVE'
       retries: "{{ cw_eks_addon_retries | int }}"
       delay: "{{ cw_eks_addon_delay | int }}"
@@ -1028,7 +1161,7 @@
         AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
         AWS_SESSION_TOKEN: "{{ aws_session_token }}"
       register: cw_eks_datapoints
-      loop: "{{ cw_eks_clusters }}"
+      loop: "{{ cw_eks_targets }}"
       until: (cw_eks_datapoints.stdout | default('0') | trim | int) > 0
       retries: "{{ cw_eks_verify_retries | int }}"
       delay: "{{ cw_eks_verify_delay | int }}"
