@@ -31,4 +31,4 @@
   tasks:
     - name: include tasks to install and configure the cloudwatch agent
       include_tasks: tasks/aws-cloudwatch-agent.yml
-      tags: cw-agent
+      tags: [cw-agent, cw-eks]
