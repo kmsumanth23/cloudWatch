@@ -119,20 +119,26 @@ cw_verify_delay: 30
 # opts in.
 cw_eks_flag_name: cloudwatch_eks_addon
 
-# Clusters to configure, named explicitly per client environment, IN
-# aws-client-vars-env.yml:
-#   cw_eks_clusters:
-#     - eks-hxsa-d-us-east-1-7
+# OPTIONAL. Normally left empty: the cluster is discovered at run time from
+# the VPC of the host the job is already running on. Each environment has its
+# own VPC, so the cluster sharing it is this environment's, and the other
+# environments' clusters in the same account are filtered out.
 #
-# It is read out of the same raw read as the opt-in flags, not through the
-# normal vars chain. That file cannot be loaded as ordinary vars in this play
-# -- it contains {{ }} references that do not resolve in this context -- so a
-# list placed there is invisible to every other mechanism. A job can still
-# override it with -e cw_eks_clusters='[...]', which outranks the read.
+# Tags were the obvious alternative and are not usable -- every cluster in the
+# account carries an empty tag set. Cluster names are never derived from a
+# naming convention either; nothing about the name is parsed.
 #
-# NEVER discovered. One AWS account holds several of our environments, so
-# `aws eks list-clusters` would return other environments' clusters and this
-# play would reconfigure them. Empty with the flag true is a hard failure.
+# Discovery refuses to guess: zero matches fails, and so does more than one.
+#
+# Set this ONLY for an environment where the VPC assumption does not hold.
+# At launch, as AWX extra vars (a YAML field, so this gives a real list):
+#   cw_eks_clusters: ["eks-hxsa-d-us-east-1-7"]
+# From the CLI, the JSON form -- `-e key=value` would give a string:
+#   -e '{"cw_eks_clusters":["eks-hxsa-d-us-east-1-7"]}'
+#
+# The play resolves whatever arrives into cw_eks_targets, coercing a string
+# form to a list, because an extra var outranks set_fact and discovery could
+# never write back to this name.
 cw_eks_clusters: []
 
 # Defaults to cw_role_name — the same role the EC2 agent uses, which is the
