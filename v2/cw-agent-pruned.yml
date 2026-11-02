@@ -1,0 +1,1053 @@
+---
+# aws-v9-automation/tasks/aws-cloudwatch-agent.yml
+#
+# Installs the Amazon CloudWatch agent and configures it to publish memory
+# utilization, for every host in this client environment's inventory.
+#
+# Runs against the play's hosts (hosts: all). AWS CLI calls run ON the host
+# with the assumed-role credentials supplied through environment:, the same
+# pattern tasks/aws-cert-import.yml uses for `aws acm import-certificate`.
+# Nothing is delegated and nothing is discovered — the inventory is the
+# target list.
+
+# ==================================================================
+# NAMING
+#
+# Role and instance profile names are DERIVED from client_code, never
+# hardcoded, and are then verified to exist through the AWS CLI. Only the
+# client portion varies between clients.
+#
+#   hxsa -> HCLSW_AWS_HXSA_EC2_CLOUDWATCH_FULLACCESS_SVC_ROLE     (role)
+#           HCLSW_AWS_HXSA_EC2_CLOUDWATCH_FULLACCESS_SVC_PROFILE  (instance profile)
+#
+# Override cw_role_name / cw_profile_name if a client ever deviates. hxsa's
+# live profile predates this convention and is named ..._SVC_ROLE; pin it with
+# cw_profile_name in that client environment's vars file until it is migrated.
+# ==================================================================
+
+- name: Resolve CloudWatch agent naming and settings
+  set_fact:
+    cw_agent_flag_name: "{{ cw_agent_flag_name | default('cloudwatch_agent_enabled') }}"
+    cw_role_name: >-
+      {{ cw_role_name
+         | default('HCLSW_AWS_' ~ (client_code | upper) ~ '_EC2_CLOUDWATCH_FULLACCESS_SVC_ROLE', true) }}
+    cw_profile_name: >-
+      {{ cw_profile_name
+         | default('HCLSW_AWS_' ~ (client_code | upper) ~ '_EC2_CLOUDWATCH_FULLACCESS_SVC_PROFILE', true) }}
+    cw_region: "{{ cw_region | default(aws_region, true) }}"
+    cw_aws_cli: "{{ cw_aws_cli | default('/usr/local/bin/aws', true) }}"
+  tags: cw-agent
+
+# ==================================================================
+# GATE
+#
+# The client environment vars file is read for the opt-in flag and, where a
+# client deviates, cw_eks_clusters. They cannot arrive any other way: this
+# play cannot load that file as ordinary vars (see below), so anything a
+# client environment must tell this play has to come out of this one read.
+#
+# Read with the custom-delimiter template trick used by
+# awx-workflow-certs-aws.yml: aws-client-vars-env.yml contains regular
+# {{ }} references (security_groups, aws_subnets_custom, ...) that would
+# raise undefined-variable errors if rendered in this play's context.
+# ==================================================================
+- name: Resolve the client environment vars file path
+  set_fact:
+    cw_client_env_file: "{{ client_vars_directory }}/{{ client_code }}/{{ client_env }}/aws-client-vars-env.yml"
+  tags: cw-agent
+
+# - name: Read the CloudWatch agent flag from the client environment vars file
+#   set_fact:
+#     cw_enabled: "{{ cw_env_file_vars[cw_agent_flag_name] | default(false) }}"
+#   vars:
+#     cw_env_file_vars: >-
+#       {{ lookup('template', cw_client_env_file, errors='ignore',
+#                 variable_start_string='[%', variable_end_string='%]')
+#          | from_yaml | default({}, true) }}
+#   tags: cw-agent
+
+# no_log: the fact holds the WHOLE client environment vars file. Only one
+# boolean is wanted from it, and it is discarded immediately after parsing.
+# errors='ignore': a client environment with no such file skips cleanly
+# instead of failing the run.
+- name: Read raw file content from controller
+  set_fact:
+    cw_raw_content: "{{ lookup('file', cw_client_env_file, errors='ignore') | default('', true) }}"
+  delegate_to: localhost
+  no_log: true
+  tags: cw-agent
+
+- name: Parse and evaluate CloudWatch agent flag
+  set_fact:
+    cw_enabled: >-
+      {{ (cw_raw_content | from_yaml | default({}, true)).get(cw_agent_flag_name, false) | bool }}
+    cw_eks_clusters: >-
+      {{ (cw_raw_content | from_yaml | default({}, true)).get('cw_eks_clusters',
+         cw_eks_clusters | default([], true)) }}
+  tags: cw-agent
+
+- name: Discard the client environment file content
+  set_fact:
+    cw_raw_content: ""
+  tags: cw-agent
+
+# - name: DEBUG - Check what the lookup is returning
+#   debug:
+#     msg: 
+#       - "Target file path: {{ cw_client_env_file }}"
+#       - "Raw content read: {{ lookup('file', cw_client_env_file, errors='warn') }}"
+#   tags: cw-agent
+
+- name: Fail on an unrecognised cw_scope
+  fail:
+    msg: >-
+      cw_scope is '{{ cw_scope }}'. Valid values are all (both EC2 and EKS,
+      subject to each flag), ec2, or eks.
+  when: cw_scope not in ['all', 'ec2', 'eks']
+  run_once: true
+  tags: cw-agent
+
+- name: Report the CloudWatch agent decision for this client environment
+  debug:
+    msg: >-
+      {{ client_code }}/{{ client_env }}:
+      {{ cw_agent_flag_name }}={{ cw_enabled }}
+      ({{ cw_client_env_file }})
+      {{ '- proceeding' if (cw_enabled | bool and cw_scope in ['all', 'ec2'])
+         else ('- out of scope (cw_scope=' ~ cw_scope ~ ')'
+               if (cw_enabled | bool) else '- not enabled, skipping') }}
+  run_once: true
+  tags: cw-agent
+
+- name: Resolve the EKS cluster list given at launch or in the environment file
+  set_fact:
+    cw_eks_targets: >-
+      {{ ((cw_eks_clusters | from_yaml) or []) if (cw_eks_clusters is string)
+         else (cw_eks_clusters | default([], true)) }}
+  tags: cw-agent
+
+# ==================================================================
+# ONE GATE, ONE SESSION, ONE SET OF PREREQUISITES
+#
+# cloudwatch_agent in the client environment vars file turns CloudWatch
+# monitoring on for this environment; cw_scope decides which legs run.
+#
+# Everything both legs need sits here and is done once: the assumed-role
+# session, the IAM role read, and the managed policy check. Each leg then
+# carries only what is specific to it -- instance profiles for EC2, the
+# Pod Identity trust and the add-ons for EKS.
+#
+# become and the credential environment are declared on each leg's block
+# rather than on every task inside it. Child tasks, including those in
+# nested blocks, inherit both.
+# ==================================================================
+- name: Configure CloudWatch monitoring for this client environment
+  when: cw_enabled | bool
+  tags: cw-agent
+  block:
+
+    - name: Get authentication session details
+      sts_assume_role:
+        role_arn: "{{ arn_auto_admin_val }}"
+        role_session_name: operstssess0
+        aws_access_key: "{{ access_val }}"
+        aws_secret_key: "{{ sec_val }}"
+        duration_seconds: 3600
+        aws_region: "{{ aws_region }}"
+      register: assumed_role
+      delegate_to: localhost
+      run_once: true
+      no_log: true
+
+    # set_fact defaults to cacheable: no, so these never reach the AWX fact
+    # cache. Do not add cacheable: yes here.
+    - name: Set AWS STS credentials
+      set_fact:
+        aws_access_key: "{{ assumed_role.sts_creds.access_key }}"
+        aws_secret_key: "{{ assumed_role.sts_creds.secret_key }}"
+        aws_session_token: "{{ assumed_role.sts_creds.session_token }}"
+      no_log: true
+
+    # ============================================================
+    # SHARED PREREQUISITES
+    #
+    # The role is created by the IAM team and verified here, never created.
+    # One read serves both legs: EC2 needs it to exist, EKS additionally
+    # parses its trust policy and ARN out of the same response.
+    #
+    # This task carries the anchor both legs reuse for their credentials.
+    # ============================================================
+    - name: Read the CloudWatch IAM role
+      shell: >
+        {{ cw_aws_cli }} iam get-role --role-name {{ cw_role_name }}
+      become: true
+      become_user: root
+      become_method: su
+      become_exe: sudo su -
+      environment: &cw_aws_env
+        AWS_ACCESS_KEY_ID: "{{ aws_access_key }}"
+        AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
+        AWS_SESSION_TOKEN: "{{ aws_session_token }}"
+      register: cw_role_check
+      changed_when: false
+      failed_when: false
+      run_once: true
+
+    - name: Fail when the CloudWatch IAM role does not exist
+      fail:
+        msg: >-
+          IAM role {{ cw_role_name }} was not found in this account. It is a
+          prerequisite created by the IAM team, trusting ec2.amazonaws.com
+          with CloudWatchAgentServerPolicy attached, plus
+          pods.eks.amazonaws.com where EKS is in use.
+          AWS reported: {{ cw_role_check.stderr | default('') | trim }}
+      when: cw_role_check.rc != 0
+      run_once: true
+
+    - name: Record the CloudWatch role ARN
+      set_fact:
+        cw_role_arn: "{{ (cw_role_check.stdout | from_json).Role.Arn }}"
+      run_once: true
+
+    # CloudWatchAgentServerPolicy carries PutMetricData, which the EC2 agent
+    # needs, and the Logs write actions, which Container Insights needs for
+    # its embedded-metric-format transport. Absent, neither leg can publish,
+    # so it is checked before either does any work.
+    #
+    # This assumes the AWS managed policy by name. A client granting the same
+    # actions through an inline policy would fail here; name the policy they
+    # do attach in cw_eks_required_policy for that client.
+    - name: Read the policies attached to the CloudWatch IAM role
+      shell: >
+        {{ cw_aws_cli }} iam list-attached-role-policies
+        --role-name {{ cw_role_name }}
+        --query 'AttachedPolicies[].PolicyName' --output text
+      become: true
+      become_user: root
+      become_method: su
+      become_exe: sudo su -
+      environment: *cw_aws_env
+      register: cw_role_policies
+      changed_when: false
+      failed_when: false
+      run_once: true
+
+    - name: Fail when CloudWatchAgentServerPolicy is not attached to the role
+      fail:
+        msg: >-
+          Role {{ cw_role_name }} does not have {{ cw_eks_required_policy }}
+          attached. Without it the EC2 agent cannot call PutMetricData and
+          Container Insights cannot write its metric log events, so neither
+          leg would publish anything. Attached now:
+          {{ cw_role_policies.stdout | default('(none)') | trim }}
+      when: cw_eks_required_policy not in (cw_role_policies.stdout | default(''))
+      run_once: true
+
+    - name: Install and configure the CloudWatch agent
+      when: cw_scope in ['all', 'ec2']
+      become: true
+      become_user: root
+      become_method: su
+      become_exe: sudo su -
+      environment: *cw_aws_env
+      block:
+
+        - name: Fail on a collection interval that needs high-resolution metrics
+          fail:
+            msg: >-
+              cw_agent_interval is {{ cw_agent_interval }}. Values below 60
+              require high-resolution metrics, which this configuration does not
+              enable and which costs considerably more. Use 60 or a multiple.
+          when: (cw_agent_interval | int) < 60
+          run_once: true
+
+        # ============================================================
+        # PREREQUISITE VERIFICATION
+        #
+        # The role and instance profile are created by the IAM team. Verified
+        # here rather than assumed: a missing instance profile is the failure
+        # that looks like everything worked. Checked once per run, not per host.
+        # ============================================================
+        - name: Check the CloudWatch instance profile exists
+          shell: >
+            {{ cw_aws_cli }} iam get-instance-profile
+            --instance-profile-name {{ cw_profile_name }}
+          register: cw_profile_check
+          changed_when: false
+          failed_when: false
+          run_once: true
+
+        - name: Fail when the CloudWatch instance profile does not exist
+          fail:
+            msg: >-
+              Instance profile {{ cw_profile_name }} was not found. A role with
+              EC2 trust cannot be attached to an instance without one; the IAM
+              team must create it and add {{ cw_role_name }} to it.
+              AWS reported: {{ cw_profile_check.stderr | default('') | trim }}
+          when: cw_profile_check.rc != 0
+          run_once: true
+
+        - name: Confirm the role is a member of the instance profile
+          set_fact:
+            cw_profile_roles: >-
+              {{ (cw_profile_check.stdout | from_json).InstanceProfile.Roles
+                 | map(attribute='RoleName') | list }}
+          run_once: true
+
+        - name: Fail when the instance profile does not contain the role
+          fail:
+            msg: >-
+              Instance profile {{ cw_profile_name }} exists but contains
+              {{ cw_profile_roles | join(', ') | default('no roles', true) }},
+              not {{ cw_role_name }}. The IAM team must add the role to the
+              profile.
+          when: cw_role_name not in cw_profile_roles
+          run_once: true
+
+        # ============================================================
+        # INSTANCE IDENTITY
+        #
+        # Each host reports its own instance id from IMDS. IMDSv2 token first,
+        # falling back to v1 for instances that still allow it.
+        # ============================================================
+        - name: Get an IMDSv2 token
+          shell: >
+            curl -s -m 5 -X PUT "http://169.254.169.254/latest/api/token"
+            -H "X-aws-ec2-metadata-token-ttl-seconds: 300"
+          register: cw_imds_token
+          changed_when: false
+          failed_when: false
+
+        - name: Get this host's EC2 instance id
+          shell: >
+            curl -s -m 5
+            {% if cw_imds_token.stdout | default('') | length > 0 %}
+            -H "X-aws-ec2-metadata-token: {{ cw_imds_token.stdout }}"
+            {% endif %}
+            http://169.254.169.254/latest/meta-data/instance-id
+          register: cw_instance_id_raw
+          changed_when: false
+          failed_when: false
+
+        # - name: Gather EC2 metadata facts natively
+        #   amazon.aws.aws_ec2_metadata_facts:
+        #   tags: cw-agent
+
+        # - name: Set instance ID fact
+        #   set_fact:
+        #     cw_instance_id: "{{ ansible_ec2_instance_id }}"
+        #   tags: cw-agent
+
+        - name: Record this host's instance id
+          set_fact:
+            cw_instance_id: "{{ cw_instance_id_raw.stdout | default('') | trim }}"
+
+        - name: Fail when the instance id could not be read
+          fail:
+            msg: >-
+              Could not read the EC2 instance id from IMDS on
+              {{ inventory_hostname }}. IMDS may be disabled or hop-limited.
+          when: cw_instance_id | length == 0
+
+        # ============================================================
+        # INSTANCE PROFILE ASSOCIATION
+        #
+        # An instance holds exactly ONE instance profile. Where one is already
+        # attached and it is not ours, the run fails rather than replacing it —
+        # replacing silently removes whatever permissions the workload uses.
+        # ============================================================
+        - name: Read the instance profile currently attached to this host
+          shell: >
+            {{ cw_aws_cli }} ec2 describe-instances
+            --region {{ cw_region }}
+            --instance-ids {{ cw_instance_id }}
+            --query 'Reservations[].Instances[].IamInstanceProfile.Arn'
+            --output text
+          register: cw_current_profile
+          changed_when: false
+
+        - name: Classify the current instance profile
+          set_fact:
+            cw_profile_arn: "{{ cw_current_profile.stdout | default('') | trim }}"
+            cw_profile_absent: >-
+              {{ (cw_current_profile.stdout | default('') | trim) in ['', 'None'] }}
+            cw_profile_is_ours: >-
+              {{ cw_profile_name in (cw_current_profile.stdout | default('') | trim) }}
+
+        # Default behaviour: stop. An instance holds exactly one profile, so
+        # attaching ours removes whatever the workload was using.
+        # cw_force_profile_replace=true is the deliberate override. The replaced
+        # ARN is printed first so it can be restored afterwards.
+        - name: Fail when a different instance profile is already attached
+          fail:
+            msg: >-
+              {{ inventory_hostname }} ({{ cw_instance_id }}) already has instance
+              profile {{ cw_profile_arn }}. An instance can hold only one, so
+              attaching {{ cw_profile_name }} would remove the permissions its
+              workload is currently using. Re-run with
+              cw_force_profile_replace=true to replace it deliberately.
+          when:
+            - not (cw_profile_absent | bool)
+            - not (cw_profile_is_ours | bool)
+            - not (cw_force_profile_replace | default(false) | bool)
+
+        - name: Record the instance profile about to be replaced
+          debug:
+            msg: >-
+              FORCED REPLACEMENT on {{ inventory_hostname }}
+              ({{ cw_instance_id }}): removing {{ cw_profile_arn }} and attaching
+              {{ cw_profile_name }}. Restore the original with
+              'aws ec2 replace-iam-instance-profile-association' if required.
+          when:
+            - not (cw_profile_absent | bool)
+            - not (cw_profile_is_ours | bool)
+            - cw_force_profile_replace | default(false) | bool
+
+        - name: Read the existing instance profile association id
+          shell: >
+            {{ cw_aws_cli }} ec2 describe-iam-instance-profile-associations
+            --region {{ cw_region }}
+            --filters Name=instance-id,Values={{ cw_instance_id }}
+            --query 'IamInstanceProfileAssociations[0].AssociationId'
+            --output text
+          register: cw_existing_assoc
+          changed_when: false
+          when:
+            - not (cw_profile_absent | bool)
+            - not (cw_profile_is_ours | bool)
+            - cw_force_profile_replace | default(false) | bool
+
+        - name: Disassociate the existing instance profile
+          shell: >
+            {{ cw_aws_cli }} ec2 disassociate-iam-instance-profile
+            --region {{ cw_region }}
+            --association-id {{ cw_existing_assoc.stdout | trim }}
+          when:
+            - cw_existing_assoc is not skipped
+            - (cw_existing_assoc.stdout | default('') | trim) not in ['', 'None']
+
+        - name: Associate the CloudWatch instance profile
+          shell: >
+            {{ cw_aws_cli }} ec2 associate-iam-instance-profile
+            --region {{ cw_region }}
+            --instance-id {{ cw_instance_id }}
+            --iam-instance-profile Name={{ cw_profile_name }}
+          register: cw_associate
+          when: >-
+            (cw_profile_absent | bool)
+            or (not (cw_profile_is_ours | bool)
+                and (cw_force_profile_replace | default(false) | bool))
+
+        - name: Report the association id for rollback
+          debug:
+            msg: >-
+              {{ inventory_hostname }} ({{ cw_instance_id }}) ->
+              {{ (cw_associate.stdout | from_json).IamInstanceProfileAssociation.AssociationId }}
+          when: cw_associate is not skipped
+
+        - name: Wait for IMDS to serve the new role credentials
+          pause:
+            seconds: "{{ cw_profile_propagation_delay | default(60) }}"
+          run_once: true
+          when: cw_associate is not skipped
+
+        # ============================================================
+        # AGENT INSTALL
+        # ============================================================
+        - name: Fail when no agent package is defined for this OS family
+          fail:
+            msg: >-
+              {{ inventory_hostname }} reports OS family
+              '{{ ansible_facts['os_family'] }}', which has no entry in
+              cw_agent_package_urls.
+          when: ansible_facts['os_family'] not in cw_agent_package_urls
+
+        - name: Install the CloudWatch agent (RHEL family)
+          dnf:
+            name: "{{ cw_agent_package_urls['RedHat'] }}"
+            state: present
+            disable_gpg_check: true
+          when: ansible_facts['os_family'] == 'RedHat'
+
+        - name: Install the CloudWatch agent (Debian family)
+          apt:
+            deb: "{{ cw_agent_package_urls['Debian'] }}"
+          when: ansible_facts['os_family'] == 'Debian'
+
+        - name: Confirm the agent control binary is present
+          stat:
+            path: "{{ cw_agent_root }}/bin/amazon-cloudwatch-agent-ctl"
+          register: cw_ctl
+
+        - name: Fail when the agent did not install
+          fail:
+            msg: >-
+              Package install reported success but
+              {{ cw_agent_root }}/bin/amazon-cloudwatch-agent-ctl is missing on
+              {{ inventory_hostname }}.
+          when: not cw_ctl.stat.exists
+
+        # ============================================================
+        # CONFIGURATION
+        #
+        # The rendered file is identical on every host. ${aws:InstanceId} is an
+        # agent placeholder resolved from IMDS at startup — it is deliberately
+        # NOT templated to a literal instance id, which would make the file
+        # host-specific.
+        # ============================================================
+        - name: Deploy the agent configuration
+          template:
+            src: amazon-cloudwatch-agent.json.j2
+            dest: "{{ cw_agent_root }}/etc/{{ cw_agent_config_filename }}"
+            owner: root
+            group: root
+            mode: "0644"
+            validate: "python3 -c \"import json,sys; json.load(open('%s'))\""
+          register: cw_config
+
+        - name: Query current agent status
+          shell: >
+            {{ cw_agent_root }}/bin/amazon-cloudwatch-agent-ctl -a status
+          register: cw_agent_status
+          changed_when: false
+          failed_when: false
+
+        - name: Apply the configuration and start the agent
+          shell: >
+            {{ cw_agent_root }}/bin/amazon-cloudwatch-agent-ctl
+            -a fetch-config -m ec2 -s
+            -c file:{{ cw_agent_root }}/etc/{{ cw_agent_config_filename }}
+          when: >-
+            cw_config.changed
+            or ('"status": "running"' not in (cw_agent_status.stdout | default('')))
+
+        - name: Ensure the agent service is enabled and running
+          systemd:
+            name: "amazon-cloudwatch-agent"
+            enabled: true
+            state: started
+
+        - name: Re-read agent status after configuration
+          shell: >
+            {{ cw_agent_root }}/bin/amazon-cloudwatch-agent-ctl -a status
+          register: cw_agent_final
+          changed_when: false
+
+        - name: Fail when the agent is not running with a loaded configuration
+          fail:
+            msg: >-
+              {{ inventory_hostname }}: agent is not running with a loaded
+              configuration. {{ cw_agent_final.stdout }}
+          when: >-
+            (cw_agent_final.stdout | from_json).status != 'running'
+            or (cw_agent_final.stdout | from_json).configstatus != 'configured'
+
+        # ============================================================
+        # VERIFICATION
+        #
+        # The only step that proves the system works: an agent can report
+        # running while publishing nothing.
+        #
+        # Uses the assumed-role credentials, NOT the instance profile.
+        # CloudWatchAgentServerPolicy grants PutMetricData but not
+        # GetMetricData, so the instance cannot read its own metrics back.
+        # ============================================================
+        - name: Wait for memory datapoints to arrive in CloudWatch
+          shell: >
+            {{ cw_aws_cli }} cloudwatch get-metric-statistics
+            --region {{ cw_region }}
+            --namespace {{ cw_agent_namespace }}
+            --metric-name mem_used_percent
+            --dimensions Name=InstanceId,Value={{ cw_instance_id }}
+            --start-time $(date -u -d '{{ cw_verify_window_minutes }} minutes ago' +%Y-%m-%dT%H:%M:%SZ)
+            --end-time $(date -u +%Y-%m-%dT%H:%M:%SZ)
+            --period {{ cw_agent_interval }}
+            --statistics Average
+            --query 'length(Datapoints)'
+            --output text
+          register: cw_datapoints
+          changed_when: false
+          until: (cw_datapoints.stdout | default('0') | trim | int) > 0
+          retries: "{{ cw_verify_retries | int }}"
+          delay: "{{ cw_verify_delay | int }}"
+          when: cw_verify | bool
+
+        - name: Report the result for this host
+          debug:
+            msg: >-
+              {{ inventory_hostname }} ({{ cw_instance_id }}):
+              {{ cw_datapoints.stdout | default('0') | trim }} datapoint(s) of
+              mem_used_percent in the last
+              {{ cw_verify_window_minutes }} minutes
+          when: cw_verify | bool
+
+      # ================================================================
+      # TEARDOWN
+      #
+      # Clear the assumed-role credentials from play memory once the work is
+      # done. They were never written to disk and never cached (set_fact is
+      # cacheable: no by default); this removes them from the in-memory facts
+      # as well, so nothing downstream in a longer play can read them.
+      #
+      # In `always:` so it runs even when a task above fails.
+      # ================================================================
+
+    - name: Configure the EKS CloudWatch observability add-on
+      when: cw_scope in ['all', 'eks']
+      become: true
+      become_user: root
+      become_method: su
+      become_exe: sudo su -
+      environment: *cw_aws_env
+      block:
+
+        # ============================================================
+        # CLUSTER DISCOVERY
+        #
+        # Which clusters this job configures is derived from where the job is
+        # already running: the VPC of the host run_once picked. Each environment
+        # has its own VPC, so the cluster sharing it is this environment's.
+        #
+        # Nothing is typed anywhere. The account holds other environments'
+        # clusters and they are filtered out by VPC, not by name.
+        #
+        # Tags were the obvious alternative and are not usable: every cluster in
+        # the account carries an empty tag set.
+        #
+        # Skipped entirely when cw_eks_clusters is already set, so a launch-time
+        # -e '{"cw_eks_clusters":["name"]}' wins for an environment where the VPC
+        # assumption does not hold.
+        # ============================================================
+        - name: Discover this environment's EKS cluster
+          when: cw_eks_targets | length == 0
+          block:
+
+            - name: Read the VPC of the host this job is running from
+              shell: |
+                T=$(curl -s -m 5 -X PUT "http://169.254.169.254/latest/api/token" \
+                     -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+                if [ -n "$T" ]; then
+                  M=$(curl -s -m 5 -H "X-aws-ec2-metadata-token: $T" \
+                       http://169.254.169.254/latest/meta-data/mac)
+                  curl -s -m 5 -H "X-aws-ec2-metadata-token: $T" \
+                    "http://169.254.169.254/latest/meta-data/network/interfaces/macs/$M/vpc-id"
+                else
+                  M=$(curl -s -m 5 http://169.254.169.254/latest/meta-data/mac)
+                  curl -s -m 5 \
+                    "http://169.254.169.254/latest/meta-data/network/interfaces/macs/$M/vpc-id"
+                fi
+              register: cw_eks_vpc_raw
+              changed_when: false
+              failed_when: false
+              run_once: true
+
+            - name: Record the VPC used to scope discovery
+              set_fact:
+                cw_eks_vpc_id: "{{ cw_eks_vpc_raw.stdout | default('') | trim }}"
+              run_once: true
+
+            - name: Fail when the VPC could not be read from IMDS
+              fail:
+                msg: >-
+                  Could not read the VPC id from IMDS on {{ inventory_hostname }}.
+                  IMDS may be disabled or hop-limited. Name the cluster at launch
+                  instead: -e '{"cw_eks_clusters":["<cluster-name>"]}'
+              when: cw_eks_vpc_id | length == 0
+              run_once: true
+
+            - name: List the EKS clusters in this account
+              shell: >
+                {{ cw_aws_cli }} eks list-clusters
+                --region {{ cw_region }}
+                --query 'clusters[]' --output text
+              register: cw_eks_account_clusters
+              changed_when: false
+              run_once: true
+
+            - name: Read the VPC of each cluster in the account
+              shell: >
+                {{ cw_aws_cli }} eks describe-cluster
+                --region {{ cw_region }}
+                --name {{ item }}
+                --query 'cluster.resourcesVpcConfig.vpcId'
+                --output text
+              loop: "{{ (cw_eks_account_clusters.stdout | default('')).split() }}"
+              register: cw_eks_cluster_vpcs
+              changed_when: false
+              run_once: true
+
+            - name: Keep the clusters that share this host's VPC
+              set_fact:
+                cw_eks_discovered: >-
+                  {{ cw_eks_cluster_vpcs.results
+                     | selectattr('stdout', 'defined')
+                     | selectattr('stdout', 'search', '^' ~ cw_eks_vpc_id ~ '\s*$')
+                     | map(attribute='item') | list }}
+              run_once: true
+
+            - name: Fail when more than one cluster shares the host's VPC
+              fail:
+                msg: >-
+                  {{ cw_eks_discovered | length }} clusters share
+                  {{ cw_eks_vpc_id }}: {{ cw_eks_discovered | join(', ') }}.
+                  Discovery will not choose between them. Name the one you want:
+                  -e '{"cw_eks_clusters":["<cluster-name>"]}'
+              when: cw_eks_discovered | length > 1
+              run_once: true
+
+            - name: Use the discovered cluster
+              set_fact:
+                cw_eks_targets: "{{ cw_eks_discovered }}"
+              run_once: true
+
+        - name: Report the clusters this job will configure
+          debug:
+            msg: >-
+              {{ client_code }}/{{ client_env }}: {{ cw_eks_targets | join(', ') }}
+              {{ '(discovered from ' ~ cw_eks_vpc_id ~ ')'
+                 if cw_eks_vpc_id is defined else '(named at launch)' }}
+          run_once: true
+
+        # ============================================================
+        # INTENT DECIDES WHETHER AN ABSENT CLUSTER IS AN ERROR
+        #
+        # Nobody asked for EKS specifically: an environment with no cluster is
+        # normal, so skip and say so. Someone launched with cw_scope=eks: they
+        # asserted a cluster exists, so its absence is a real error and stops the
+        # job. This is the job the removed cloudwatch_eks_addon flag used to do,
+        # without a config key that can drift out of sync with reality.
+        # ============================================================
+        - name: Fail when EKS was asked for explicitly but no cluster was found
+          fail:
+            msg: >-
+              cw_scope=eks was requested but no EKS cluster is in
+              {{ cw_eks_vpc_id | default('(VPC unknown)') }}, the VPC of
+              {{ inventory_hostname }}. Clusters in this account:
+              {{ (cw_eks_account_clusters.stdout | default('(none)')).split() | join(', ') }}.
+              Name it explicitly if it lives elsewhere:
+              -e '{"cw_eks_clusters":["<cluster-name>"]}'
+          when:
+            - cw_eks_targets | length == 0
+            - cw_scope == 'eks'
+          run_once: true
+
+        - name: Configure the add-on on the discovered cluster
+          when: cw_eks_targets | length > 0
+          block:
+
+          # ============================================================
+          # PREREQUISITE VERIFICATION
+          #
+          # Pod Identity fails silently when the trust policy is incomplete: the
+          # association is created, the add-on reports ACTIVE, and nothing is ever
+          # published. Checked before anything is created.
+          # ============================================================
+          - name: Select the trust statements naming the EKS Pod Identity principal
+            set_fact:
+              cw_eks_trust_stmts: >-
+                {{ (cw_role_check.stdout | from_json).Role.AssumeRolePolicyDocument.Statement
+                   | selectattr('Effect', 'equalto', 'Allow')
+                   | map('to_json') | select('search', 'pods\.eks\.amazonaws\.com')
+                   | list }}
+              cw_role_arn: "{{ (cw_role_check.stdout | from_json).Role.Arn }}"
+            run_once: true
+
+          - name: Fail when the role does not trust the EKS Pod Identity principal
+            fail:
+              msg: >-
+                Role {{ cw_role_name }} does not trust pods.eks.amazonaws.com.
+                Pod Identity cannot hand its credentials to the agent. Ask the IAM
+                team to add this statement to the role's trust policy, keeping the
+                existing ec2.amazonaws.com statement intact:
+                {"Effect":"Allow","Principal":{"Service":"pods.eks.amazonaws.com"},"Action":["sts:AssumeRole","sts:TagSession"]}
+            when: cw_eks_trust_stmts | length == 0
+            run_once: true
+
+          - name: Fail when the EKS trust statement omits sts:TagSession
+            fail:
+              msg: >-
+                Role {{ cw_role_name }} trusts pods.eks.amazonaws.com but its
+                statement does not grant sts:TagSession. Pod Identity requires BOTH
+                sts:AssumeRole and sts:TagSession; with only the first, the add-on
+                reports ACTIVE and publishes nothing. Ask the IAM team to add it.
+            when: cw_eks_trust_stmts | select('search', 'sts:TagSession') | list | length == 0
+            run_once: true
+
+          - name: Read the EKS Pod Identity agent add-on status
+            shell: >
+              {{ cw_aws_cli }} eks describe-addon
+              --region {{ cw_region }}
+              --cluster-name {{ item }}
+              --addon-name {{ cw_eks_identity_addon }}
+              --query 'addon.status' --output text
+            register: cw_eks_identity_status
+            loop: "{{ cw_eks_targets }}"
+            changed_when: false
+            failed_when: false
+            run_once: true
+
+          - name: Install the EKS Pod Identity agent add-on where it is absent
+            shell: >
+              {{ cw_aws_cli }} eks create-addon
+              --region {{ cw_region }}
+              --cluster-name {{ item.item }}
+              --addon-name {{ cw_eks_identity_addon }}
+            loop: "{{ cw_eks_identity_status.results }}"
+            loop_control:
+              label: "{{ item.item }}"
+            when: item.rc != 0
+            register: cw_eks_identity_create
+            changed_when: cw_eks_identity_create.rc == 0
+            failed_when: >-
+              cw_eks_identity_create.rc != 0
+              and 'ResourceInUseException' not in (cw_eks_identity_create.stderr | default(''))
+            run_once: true
+
+          - name: Wait for the EKS Pod Identity agent add-on to become active
+            shell: >
+              {{ cw_aws_cli }} eks describe-addon
+              --region {{ cw_region }}
+              --cluster-name {{ item }}
+              --addon-name {{ cw_eks_identity_addon }}
+              --query 'addon.status' --output text
+            register: cw_eks_identity_ready
+            loop: "{{ cw_eks_targets }}"
+            failed_when: false
+            until: (cw_eks_identity_ready.stdout | default('') | trim) == 'ACTIVE'
+            retries: "{{ cw_eks_addon_retries | int }}"
+            delay: "{{ cw_eks_addon_delay | int }}"
+            changed_when: false
+            run_once: true
+
+          # ============================================================
+          # OBSERVABILITY ADD-ON
+          #
+          # An add-on that already exists is left alone: its configuration may have
+          # been tuned by hand, and re-creating it would discard that. Set
+          # cw_eks_force_recreate at launch to replace one that exists but is not
+          # publishing — the only API-only way to restart its pods.
+          # ============================================================
+          - name: Read the EKS CloudWatch observability add-on status
+            shell: >
+              {{ cw_aws_cli }} eks describe-addon
+              --region {{ cw_region }}
+              --cluster-name {{ item }}
+              --addon-name {{ cw_eks_addon_name }}
+              --query 'addon.status' --output text
+            register: cw_eks_addon_status
+            loop: "{{ cw_eks_targets }}"
+            changed_when: false
+            failed_when: false
+            run_once: true
+
+          - name: Report the EKS observability add-on state before any change
+            debug:
+              msg: >-
+                {{ item.item }}:
+                {{ cw_eks_addon_name }} =
+                {{ (item.stdout | trim) if item.rc == 0 else 'ABSENT' }}
+                {{ '- will be recreated (cw_eks_force_recreate)'
+                   if (item.rc == 0 and (cw_eks_force_recreate | bool))
+                   else ('- will be installed' if item.rc != 0 else '- left as is') }}
+            loop: "{{ cw_eks_addon_status.results }}"
+            loop_control:
+              label: "{{ item.item }}"
+            run_once: true
+
+          - name: Remove the EKS observability add-on before recreating it
+            shell: >
+              {{ cw_aws_cli }} eks delete-addon
+              --region {{ cw_region }}
+              --cluster-name {{ item.item }}
+              --addon-name {{ cw_eks_addon_name }}
+            loop: "{{ cw_eks_addon_status.results }}"
+            loop_control:
+              label: "{{ item.item }}"
+            when:
+              - cw_eks_force_recreate | bool
+              - item.rc == 0
+            run_once: true
+
+          - name: Wait for the removed add-on to disappear
+            shell: >
+              {{ cw_aws_cli }} eks describe-addon
+              --region {{ cw_region }}
+              --cluster-name {{ item.item }}
+              --addon-name {{ cw_eks_addon_name }}
+              --query 'addon.status' --output text
+            register: cw_eks_addon_gone
+            loop: "{{ cw_eks_addon_status.results }}"
+            loop_control:
+              label: "{{ item.item }}"
+            when:
+              - cw_eks_force_recreate | bool
+              - item.rc == 0
+            until: cw_eks_addon_gone.rc != 0
+            retries: "{{ cw_eks_addon_retries | int }}"
+            delay: "{{ cw_eks_addon_delay | int }}"
+            changed_when: false
+            failed_when: false
+            run_once: true
+
+          # --pod-identity-associations is what binds the role to the
+          # amazon-cloudwatch/cloudwatch-agent service account. Without it the
+          # add-on installs and runs with no credentials at all.
+          - name: Install the EKS CloudWatch observability add-on
+            shell: >
+              {{ cw_aws_cli }} eks create-addon
+              --region {{ cw_region }}
+              --cluster-name {{ item.item }}
+              --addon-name {{ cw_eks_addon_name }}
+              {{ ('--addon-version ' ~ cw_eks_addon_version) if cw_eks_addon_version else '' }}
+              --pod-identity-associations
+              serviceAccount=cloudwatch-agent,roleArn={{ cw_role_arn }}
+            loop: "{{ cw_eks_addon_status.results }}"
+            loop_control:
+              label: "{{ item.item }}"
+            when: item.rc != 0 or (cw_eks_force_recreate | bool)
+            register: cw_eks_addon_create
+            changed_when: cw_eks_addon_create.rc == 0
+            failed_when: >-
+              cw_eks_addon_create.rc != 0
+              and 'ResourceInUseException' not in (cw_eks_addon_create.stderr | default(''))
+            run_once: true
+
+          - name: Wait for the EKS CloudWatch observability add-on to become active
+            shell: >
+              {{ cw_aws_cli }} eks describe-addon
+              --region {{ cw_region }}
+              --cluster-name {{ item }}
+              --addon-name {{ cw_eks_addon_name }}
+              --query 'addon.status' --output text
+            register: cw_eks_addon_ready
+            loop: "{{ cw_eks_targets }}"
+            failed_when: false
+            until: (cw_eks_addon_ready.stdout | default('') | trim) == 'ACTIVE'
+            retries: "{{ cw_eks_addon_retries | int }}"
+            delay: "{{ cw_eks_addon_delay | int }}"
+            changed_when: false
+            run_once: true
+
+          # ============================================================
+          # VERIFICATION
+          #
+          # The only step that proves the system works. An ACTIVE add-on with a
+          # correct association published nothing for an hour during the pilot
+          # because the Pod Identity agent was missing; every status check above
+          # passed throughout. Queries the metric actually wanted, for the cluster
+          # actually configured.
+          # ============================================================
+          - name: Wait for node memory datapoints to arrive in CloudWatch
+            shell: >
+              {{ cw_aws_cli }} cloudwatch get-metric-statistics
+              --region {{ cw_region }}
+              --namespace ContainerInsights
+              --metric-name node_memory_utilization
+              --dimensions Name=ClusterName,Value={{ item }}
+              --start-time $(date -u -d '{{ cw_verify_window_minutes }} minutes ago' +%Y-%m-%dT%H:%M:%SZ)
+              --end-time $(date -u +%Y-%m-%dT%H:%M:%SZ)
+              --period 300
+              --statistics Average
+              --query 'length(Datapoints)'
+              --output text
+            register: cw_eks_datapoints
+            loop: "{{ cw_eks_targets }}"
+            until: (cw_eks_datapoints.stdout | default('0') | trim | int) > 0
+            retries: "{{ cw_verify_retries | int }}"
+            delay: "{{ cw_verify_delay | int }}"
+            changed_when: false
+            when: cw_verify | bool
+            run_once: true
+
+          - name: Report the EKS result for each cluster
+            debug:
+              msg: >-
+                {{ item.item }}:
+                {{ item.stdout | default('0') | trim }} datapoint(s) of
+                node_memory_utilization in the last
+                {{ cw_verify_window_minutes }} minutes
+            loop: "{{ cw_eks_datapoints.results | default([]) }}"
+            loop_control:
+              label: "{{ item.item }}"
+            when: cw_verify | bool
+            run_once: true
+
+  # ================================================================
+  # TEARDOWN
+  #
+  # Clear the assumed-role credentials from play memory once both legs are
+  # done. They were never written to disk and never cached (set_fact is
+  # cacheable: no by default); this removes them from the in-memory facts
+  # as well, so nothing downstream in a longer play can read them.
+  #
+  # In `always:` so it runs even when a task above fails.
+  # ================================================================
+  always:
+    - name: Clear assumed-role credentials from memory
+      set_fact:
+        aws_access_key: ""
+        aws_secret_key: ""
+        aws_session_token: ""
+        assumed_role: {}
+      no_log: true
+      tags: cw-agent
+
+# ==================================================================
+# RUN SUMMARY
+#
+# With the separate EKS flag gone, the job output is the only record of
+# whether EKS was configured or quietly skipped. One line says which, and
+# set_stats publishes the same facts as AWX workflow artifacts so a workflow
+# can branch or alert on a skip rather than depending on someone reading
+# the log.
+#
+# Outside both blocks, so it reports even when neither ran.
+# ==================================================================
+- name: Resolve what this run actually did
+  set_fact:
+    cw_ec2_outcome: >-
+      {{ 'not enabled' if not (cw_enabled | bool)
+         else ('out of scope' if cw_scope not in ['all', 'ec2']
+               else (ansible_play_hosts | length | string ~ ' host(s)')) }}
+    cw_eks_outcome: >-
+      {{ 'not enabled' if not (cw_enabled | bool)
+         else ('out of scope' if cw_scope not in ['all', 'eks']
+               else ((cw_eks_targets | join(', ')) ~
+                     ((' (' ~ (cw_eks_datapoints.results
+                               | map(attribute='stdout') | map('trim') | join(','))
+                        ~ ' datapoint(s))')
+                      if (cw_eks_datapoints is defined
+                          and cw_eks_datapoints.results is defined) else '')
+                    if (cw_eks_targets | default([]) | length > 0)
+                    else ('no cluster in '
+                          ~ (cw_eks_vpc_id | default('(VPC not read)'))
+                          ~ ' - skipped'))) }}
+  run_once: true
+  tags: cw-agent
+
+- name: Report what this run did
+  debug:
+    msg: >-
+      {{ client_code }}/{{ client_env }} (cw_scope={{ cw_scope }}) |
+      EC2: {{ cw_ec2_outcome }} |
+      EKS: {{ cw_eks_outcome }}
+  run_once: true
+  tags: cw-agent
+
+# A skipped EKS leg is a green job. These artifacts are what lets a workflow
+# notice that without a human reading the output.
+- name: Publish the run outcome as AWX workflow artifacts
+  set_stats:
+    data:
+      cw_client: "{{ client_code }}/{{ client_env }}"
+      cw_scope: "{{ cw_scope }}"
+      cw_ec2_outcome: "{{ cw_ec2_outcome }}"
+      cw_eks_outcome: "{{ cw_eks_outcome }}"
+      cw_eks_clusters_configured: "{{ cw_eks_targets | default([]) }}"
+      cw_eks_skipped: >-
+        {{ (cw_enabled | bool)
+           and cw_scope in ['all', 'eks']
+           and (cw_eks_targets | default([]) | length == 0) }}
+    per_host: false
+  run_once: true
+  tags: cw-agent
