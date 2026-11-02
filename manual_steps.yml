@@ -156,3 +156,46 @@ aws cloudwatch get-metric-statistics $P \
 
 kubectl -n amazon-cloudwatch get ds cloudwatch-agent
 kubectl get nodes
+
+
+######
+
+P="--profile srvchxsa"
+C=eks-hxsa-d-us-east-1-7
+
+aws eks delete-addon $P --cluster-name $C --addon-name amazon-cloudwatch-observability
+aws eks delete-addon $P --cluster-name $C --addon-name eks-pod-identity-agent
+
+aws eks list-addons $P --cluster-name $C
+aws eks list-pod-identity-associations $P --cluster-name $C    # expect []
+kubectl get ns | grep -i cloudwatch                            # expect nothing
+
+#check
+aws cloudwatch get-metric-statistics $P \
+  --namespace ContainerInsights --metric-name node_memory_utilization \
+  --dimensions Name=ClusterName,Value=$C \
+  --start-time $(date -u -d '20 minutes ago' +%Y-%m-%dT%H:%M:%SZ) \
+  --end-time $(date -u +%Y-%m-%dT%H:%M:%SZ) \
+  --period 300 --statistics Average --query 'length(Datapoints)' --output text
+
+aws eks create-addon help | grep -A3 pod-identity-associations
+
+sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a stop
+sudo systemctl disable --now amazon-cloudwatch-agent
+sudo yum remove -y amazon-cloudwatch-agent
+sudo rm -rf /opt/aws/amazon-cloudwatch-agent
+
+P="--profile srvchxsa"
+aws ec2 describe-iam-instance-profile-associations $P \
+  --filters Name=instance-id,Values=i-051a3ed2c30e1e36d \
+  --query 'IamInstanceProfileAssociations[].AssociationId' --output text
+
+aws ec2 disassociate-iam-instance-profile $P --association-id <id-from-above>
+
+aws cloudwatch get-metric-statistics $P --namespace CWAgent \
+  --metric-name mem_used_percent \
+  --dimensions Name=InstanceId,Value=i-051a3ed2c30e1e36d \
+  --start-time $(date -u -d '15 minutes ago' +%Y-%m-%dT%H:%M:%SZ) \
+  --end-time $(date -u +%Y-%m-%dT%H:%M:%SZ) \
+  --period 60 --statistics Average --query 'length(Datapoints)' --output text
+
