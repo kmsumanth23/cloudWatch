@@ -114,31 +114,14 @@ cw_verify_delay: 30
 # client environment may enable either, both or neither.
 # ============================================================================
 
-# Flag read from the client environment vars file, out of the same single read
-# that resolves cloudwatch_agent. Setting it true there is how an environment
-# opts in.
-cw_eks_flag_name: cloudwatch_eks_addon
+# ONE flag governs both legs: cloudwatch_agent in the client environment vars
+# file. There is deliberately no separate EKS flag -- a second key is a second
+# thing to get wrong at provisioning time, and forgetting it leaves a cluster
+# unmonitored with a green job.
+#
+# Whether an absent cluster is an error is decided by intent instead, at run
+# time: see cw_scope below.
 
-# OPTIONAL. Normally left empty: the cluster is discovered at run time from
-# the VPC of the host the job is already running on. Each environment has its
-# own VPC, so the cluster sharing it is this environment's, and the other
-# environments' clusters in the same account are filtered out.
-#
-# Tags were the obvious alternative and are not usable -- every cluster in the
-# account carries an empty tag set. Cluster names are never derived from a
-# naming convention either; nothing about the name is parsed.
-#
-# Discovery refuses to guess: zero matches fails, and so does more than one.
-#
-# Set this ONLY for an environment where the VPC assumption does not hold.
-# At launch, as AWX extra vars (a YAML field, so this gives a real list):
-#   cw_eks_clusters: ["eks-hxsa-d-us-east-1-7"]
-# From the CLI, the JSON form -- `-e key=value` would give a string:
-#   -e '{"cw_eks_clusters":["eks-hxsa-d-us-east-1-7"]}'
-#
-# The play resolves whatever arrives into cw_eks_targets, coercing a string
-# form to a list, because an extra var outranks set_fact and discovery could
-# never write back to this name.
 cw_eks_clusters: []
 
 # Defaults to cw_role_name — the same role the EC2 agent uses, which is the
@@ -187,3 +170,19 @@ cw_eks_verify_metric: node_memory_utilization
 cw_eks_verify_window_minutes: 20
 cw_eks_verify_retries: 20
 cw_eks_verify_delay: 30
+
+# ----------------------------------------------------------------------------
+# RUN SCOPE
+#
+# What to do on THIS run, as opposed to what exists in this environment.
+# The two opt-in flags say what exists and are set once at provisioning; this
+# says which of them to act on now, and is normally passed only at launch.
+#
+#   all  (default)  both, subject to each flag
+#   ec2             the agent on inventory hosts only
+#   eks             the observability add-on only
+#
+# An EKS-only re-run is one AWX extra var:
+#   cw_scope: eks
+# ----------------------------------------------------------------------------
+cw_scope: all
