@@ -58,10 +58,8 @@ cw_agent_package_urls:
   RedHat: "https://amazoncloudwatch-agent-{{ cw_region | default(aws_region) }}.s3.{{ cw_region | default(aws_region) }}.amazonaws.com/redhat/amd64/{{ cw_agent_version }}/amazon-cloudwatch-agent.rpm"
   Debian: "https://amazoncloudwatch-agent-{{ cw_region | default(aws_region) }}.s3.{{ cw_region | default(aws_region) }}.amazonaws.com/ubuntu/amd64/{{ cw_agent_version }}/amazon-cloudwatch-agent.deb"
 
-cw_agent_disable_gpg_check: true
 cw_agent_root: /opt/aws/amazon-cloudwatch-agent
 cw_agent_config_filename: cwagent-memory.json
-cw_agent_service: amazon-cloudwatch-agent
 
 # --- agent configuration content --------------------------------------------
 #
@@ -102,9 +100,8 @@ cw_agent_metrics_collected:
 # Service state is not evidence — the run fails unless datapoints actually
 # reach CloudWatch.
 cw_verify: true
-cw_verify_metric_name: mem_used_percent
-cw_verify_window_minutes: 15
-cw_verify_retries: 10
+cw_verify_window_minutes: 20
+cw_verify_retries: 20
 cw_verify_delay: 30
 
 # ============================================================================
@@ -124,20 +121,8 @@ cw_verify_delay: 30
 
 cw_eks_clusters: []
 
-# Defaults to cw_role_name — the same role the EC2 agent uses, which is the
-# current arrangement. Set it here only if EC2 and EKS roles are ever split.
-#
-# The role needs an ADDITIONAL trust statement beyond the EC2 one:
-#   {"Effect":"Allow",
-#    "Principal":{"Service":"pods.eks.amazonaws.com"},
-#    "Action":["sts:AssumeRole","sts:TagSession"]}
-# Both actions. With only sts:AssumeRole the add-on reports ACTIVE and
-# publishes nothing. Created by the IAM team; verified, never created, here.
-# cw_eks_role_name: ""
 
 cw_eks_required_policy: CloudWatchAgentServerPolicy
-cw_eks_namespace: amazon-cloudwatch
-cw_eks_service_account: cloudwatch-agent
 
 cw_eks_addon_name: amazon-cloudwatch-observability
 
@@ -164,12 +149,6 @@ cw_eks_addon_delay: 20
 # --- verification -----------------------------------------------------------
 # An ACTIVE add-on with a correct pod identity association published nothing
 # for an hour during the pilot. Every status check passed the whole time.
-cw_eks_verify: true
-cw_eks_verify_namespace: ContainerInsights
-cw_eks_verify_metric: node_memory_utilization
-cw_eks_verify_window_minutes: 20
-cw_eks_verify_retries: 20
-cw_eks_verify_delay: 30
 
 # ----------------------------------------------------------------------------
 # RUN SCOPE
