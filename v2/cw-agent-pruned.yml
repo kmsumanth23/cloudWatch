@@ -27,7 +27,6 @@
 
 - name: Resolve CloudWatch agent naming and settings
   set_fact:
-    cw_agent_flag_name: "{{ cw_agent_flag_name | default('cloudwatch_agent_enabled') }}"
     cw_role_name: >-
       {{ cw_role_name
          | default('HCLSW_AWS_' ~ (client_code | upper) ~ '_EC2_CLOUDWATCH_FULLACCESS_SVC_ROLE', true) }}
@@ -58,7 +57,7 @@
 
 # - name: Read the CloudWatch agent flag from the client environment vars file
 #   set_fact:
-#     cw_enabled: "{{ cw_env_file_vars[cw_agent_flag_name] | default(false) }}"
+#     cw_ec2_enabled: "{{ cw_env_file_vars['cloudwatch_agent_ec2'] | default(false) }}"
 #   vars:
 #     cw_env_file_vars: >-
 #       {{ lookup('template', cw_client_env_file, errors='ignore',
@@ -77,10 +76,12 @@
   no_log: true
   tags: cw-agent
 
-- name: Parse and evaluate CloudWatch agent flag
+- name: Parse and evaluate the CloudWatch opt-in flags
   set_fact:
-    cw_enabled: >-
-      {{ (cw_raw_content | from_yaml | default({}, true)).get(cw_agent_flag_name, false) | bool }}
+    cw_ec2_enabled: >-
+      {{ (cw_raw_content | from_yaml | default({}, true)).get('cloudwatch_agent_ec2', false) | bool }}
+    cw_eks_enabled: >-
+      {{ (cw_raw_content | from_yaml | default({}, true)).get('cloudwatch_agent_eks', false) | bool }}
     cw_eks_clusters: >-
       {{ (cw_raw_content | from_yaml | default({}, true)).get('cw_eks_clusters',
          cw_eks_clusters | default([], true)) }}
@@ -98,24 +99,14 @@
 #       - "Raw content read: {{ lookup('file', cw_client_env_file, errors='warn') }}"
 #   tags: cw-agent
 
-- name: Fail on an unrecognised cw_scope
-  fail:
-    msg: >-
-      cw_scope is '{{ cw_scope }}'. Valid values are all (both EC2 and EKS,
-      subject to each flag), ec2, or eks.
-  when: cw_scope not in ['all', 'ec2', 'eks']
-  run_once: true
-  tags: cw-agent
-
-- name: Report the CloudWatch agent decision for this client environment
+- name: Report the CloudWatch opt-in decision for this client environment
   debug:
     msg: >-
-      {{ client_code }}/{{ client_env }}:
-      {{ cw_agent_flag_name }}={{ cw_enabled }}
-      ({{ cw_client_env_file }})
-      {{ '- proceeding' if (cw_enabled | bool and cw_scope in ['all', 'ec2'])
-         else ('- out of scope (cw_scope=' ~ cw_scope ~ ')'
-               if (cw_enabled | bool) else '- not enabled, skipping') }}
+      {{ client_code }}/{{ client_env }} ({{ cw_client_env_file }}):
+      cloudwatch_agent_ec2={{ cw_ec2_enabled }},
+      cloudwatch_agent_eks={{ cw_eks_enabled }}
+      {{ '- nothing enabled, skipping'
+         if not ((cw_ec2_enabled | bool) or (cw_eks_enabled | bool)) else '- proceeding' }}
   run_once: true
   tags: cw-agent
 
@@ -130,7 +121,8 @@
 # ONE GATE, ONE SESSION, ONE SET OF PREREQUISITES
 #
 # cloudwatch_agent in the client environment vars file turns CloudWatch
-# monitoring on for this environment; cw_scope decides which legs run.
+# cloudwatch_agent_ec2 and cloudwatch_agent_eks in the client environment
+# vars file each turn on one leg. Neither set means nothing runs, silently.
 #
 # Everything both legs need sits here and is done once: the assumed-role
 # session, the IAM role read, and the managed policy check. Each leg then
@@ -142,7 +134,7 @@
 # nested blocks, inherit both.
 # ==================================================================
 - name: Configure CloudWatch monitoring for this client environment
-  when: cw_enabled | bool
+  when: (cw_ec2_enabled | bool) or (cw_eks_enabled | bool)
   tags: cw-agent
   block:
 
@@ -244,7 +236,7 @@
       run_once: true
 
     - name: Install and configure the CloudWatch agent
-      when: cw_scope in ['all', 'ec2']
+      when: cw_ec2_enabled | bool
       become: true
       become_user: root
       become_method: su
@@ -593,7 +585,7 @@
       # ================================================================
 
     - name: Configure the EKS CloudWatch observability add-on
-      when: cw_scope in ['all', 'eks']
+      when: cw_eks_enabled | bool
       become: true
       become_user: root
       become_method: su
@@ -709,26 +701,24 @@
           run_once: true
 
         # ============================================================
-        # INTENT DECIDES WHETHER AN ABSENT CLUSTER IS AN ERROR
+        # AN ABSENT CLUSTER WITH THE FLAG SET IS AN ERROR
         #
-        # Nobody asked for EKS specifically: an environment with no cluster is
-        # normal, so skip and say so. Someone launched with cw_scope=eks: they
-        # asserted a cluster exists, so its absence is a real error and stops the
-        # job. This is the job the removed cloudwatch_eks_addon flag used to do,
-        # without a config key that can drift out of sync with reality.
+        # cloudwatch_agent_eks being true is a standing assertion that this
+        # environment has a cluster, so finding none is a real error rather
+        # than a quiet skip. An environment with no cluster leaves the flag
+        # unset and never reaches this leg at all.
         # ============================================================
-        - name: Fail when EKS was asked for explicitly but no cluster was found
+        - name: Fail when the EKS flag is set but no cluster was found
           fail:
             msg: >-
-              cw_scope=eks was requested but no EKS cluster is in
+              cloudwatch_agent_eks is true for this environment but no EKS
+              cluster is in
               {{ cw_eks_vpc_id | default('(VPC unknown)') }}, the VPC of
               {{ inventory_hostname }}. Clusters in this account:
               {{ (cw_eks_account_clusters.stdout | default('(none)')).split() | join(', ') }}.
               Name it explicitly if it lives elsewhere:
               -e '{"cw_eks_clusters":["<cluster-name>"]}'
-          when:
-            - cw_eks_targets | length == 0
-            - cw_scope == 'eks'
+          when: cw_eks_targets | length == 0
           run_once: true
 
         - name: Configure the add-on on the discovered cluster
@@ -1006,13 +996,11 @@
 - name: Resolve what this run actually did
   set_fact:
     cw_ec2_outcome: >-
-      {{ 'not enabled' if not (cw_enabled | bool)
-         else ('out of scope' if cw_scope not in ['all', 'ec2']
-               else (ansible_play_hosts | length | string ~ ' host(s)')) }}
+      {{ (ansible_play_hosts | length | string ~ ' host(s)')
+         if (cw_ec2_enabled | bool) else 'not enabled' }}
     cw_eks_outcome: >-
-      {{ 'not enabled' if not (cw_enabled | bool)
-         else ('out of scope' if cw_scope not in ['all', 'eks']
-               else ((cw_eks_targets | join(', ')) ~
+      {{ 'not enabled' if not (cw_eks_enabled | bool)
+         else (((cw_eks_targets | join(', ')) ~
                      ((' (' ~ (cw_eks_datapoints.results
                                | map(attribute='stdout') | map('trim') | join(','))
                         ~ ' datapoint(s))')
@@ -1028,7 +1016,7 @@
 - name: Report what this run did
   debug:
     msg: >-
-      {{ client_code }}/{{ client_env }} (cw_scope={{ cw_scope }}) |
+      {{ client_code }}/{{ client_env }} |
       EC2: {{ cw_ec2_outcome }} |
       EKS: {{ cw_eks_outcome }}
   run_once: true
@@ -1040,13 +1028,11 @@
   set_stats:
     data:
       cw_client: "{{ client_code }}/{{ client_env }}"
-      cw_scope: "{{ cw_scope }}"
       cw_ec2_outcome: "{{ cw_ec2_outcome }}"
       cw_eks_outcome: "{{ cw_eks_outcome }}"
       cw_eks_clusters_configured: "{{ cw_eks_targets | default([]) }}"
       cw_eks_skipped: >-
-        {{ (cw_enabled | bool)
-           and cw_scope in ['all', 'eks']
+        {{ (cw_eks_enabled | bool)
            and (cw_eks_targets | default([]) | length == 0) }}
     per_host: false
   run_once: true
