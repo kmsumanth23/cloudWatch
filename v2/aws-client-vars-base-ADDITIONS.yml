@@ -13,9 +13,22 @@
 # Per the file's own header, override in the client environment vars file.
 # ----------------------------------------------------------------------------
 
-# Flag read from the client environment vars file. Setting it true there is
-# how a client environment opts in.
-cw_agent_flag_name: cloudwatch_agent
+# OPT-IN
+#
+# Two keys in the client environment vars file, read out of the single raw
+# read of that file. Each turns on one leg:
+#
+#   cloudwatch_agent_ec2: true   the agent on every host in the inventory
+#   cloudwatch_agent_eks: true   the observability add-on on this
+#                                environment's EKS cluster
+#
+# Neither set means the play does nothing, silently. They are the only
+# control: there is no run-scope argument and no master switch, so what runs
+# is whatever the environment's config says.
+#
+# cloudwatch_agent_eks is also a standing assertion that this environment has
+# a cluster, which is what makes "no cluster discovered" an error rather than
+# a quiet skip.
 
 # Role and instance profile names are DERIVED from client_code at runtime and
 # verified through the AWS CLI:
@@ -81,15 +94,6 @@ cw_agent_namespace: CWAgent
 # enable and which costs considerably more. Use 60, or a multiple of it.
 cw_agent_interval: 60
 
-cw_agent_run_as_user: cwagent
-cw_agent_debug: false
-
-cw_agent_append_dimensions:
-  InstanceId: "${aws:InstanceId}"
-
-cw_agent_aggregation_dimensions:
-  - - InstanceId
-
 cw_agent_metrics_collected:
   mem:
     measurement:
@@ -121,7 +125,6 @@ cw_verify_delay: 30
 
 cw_eks_clusters: []
 
-
 cw_eks_required_policy: CloudWatchAgentServerPolicy
 
 cw_eks_addon_name: amazon-cloudwatch-observability
@@ -150,18 +153,3 @@ cw_eks_addon_delay: 20
 # An ACTIVE add-on with a correct pod identity association published nothing
 # for an hour during the pilot. Every status check passed the whole time.
 
-# ----------------------------------------------------------------------------
-# RUN SCOPE
-#
-# What to do on THIS run, as opposed to what exists in this environment.
-# The two opt-in flags say what exists and are set once at provisioning; this
-# says which of them to act on now, and is normally passed only at launch.
-#
-#   all  (default)  both, subject to each flag
-#   ec2             the agent on inventory hosts only
-#   eks             the observability add-on only
-#
-# An EKS-only re-run is one AWX extra var:
-#   cw_scope: eks
-# ----------------------------------------------------------------------------
-cw_scope: all
